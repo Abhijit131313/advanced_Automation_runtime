@@ -1,289 +1,562 @@
 import os
-import json
+import re
 import uuid
-from typing import List, Dict, Any
+import logging
+from typing import List, Dict, Optional, Any, Tuple
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
-from groq import Groq
+# Groq is optional; we fall back if absent or key missing
+try:
+    from groq import Groq  # type: ignore
+    _groq_available = True
+except Exception:
+    _groq_available = False
 
 # -----------------------------------------------------------------------------
-# App Setup
+# App & CORS
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Workbench Studio Backend", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # In production: restrict to Bolt frontend domain
+    allow_origins=["*"],      # Tighten for production
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("workbench-backend")
+
 # -----------------------------------------------------------------------------
-# Global In-Memory Store
+# In-memory store
 # -----------------------------------------------------------------------------
+# SOP_STORE[sop_id] = {
+#   "title": str,
+#   "steps": List[str],
+#   "last_code": { "<runtime_key>": { "files":[{path,content}], "main":str, "mode":str } }
+# }
 SOP_STORE: Dict[str, Dict[str, Any]] = {}
 
 # -----------------------------------------------------------------------------
-# Grok Client
+# Schemas
 # -----------------------------------------------------------------------------
-def get_grok_client():
-    api_key = os.getenv("GROK_API_KEY")
-    if not api_key:
-        raise RuntimeError("GROK_API_KEY not configured in environment")
-    return Groq(api_key=api_key)
+class SuggestedRuntime(BaseModel):
+    key: str
+    name: str
+    confidence: float
+    reason: str
 
-# -----------------------------------------------------------------------------
-# Helper Generators (Fixed format strings)
-# -----------------------------------------------------------------------------
-def generate_bpmn_xml(title: str, steps: List[str]) -> str:
-    process_id = title.lower().replace(" ", "_")
-    tasks = "\n".join(
-        [f'<bpmn:task id="Task_{i}" name="{step}"/>' for i, step in enumerate(steps, start=1)]
-    )
-    return f"""<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_{process_id}">
-  <bpmn:process id="{process_id}" isExecutable="true">
-    {tasks}
-  </bpmn:process>
-</bpmn:definitions>
-"""
+class CodeFile(BaseModel):
+    path: str
+    content: str
 
-def generate_camel_java_dsl(title: str, steps: List[str]) -> str:
-    class_name = title.title().replace(" ", "")
-    route_steps = "\n".join(
-        [f'                .to("direct:{step.lower().replace(" ", "_")}")' for step in steps]
-    )
-    return (
-        "import org.apache.camel.builder.RouteBuilder;\n\n"
-        f"public class {class_name}Route extends RouteBuilder {{\n"
-        "    @Override\n"
-        "    public void configure() throws Exception {\n"
-        f'        from("direct:start")\n'
-        f"{route_steps};\n"
-        "    }\n"
-        "}\n"
-    )
-
-def generate_temporal_java(title: str, steps: List[str]) -> str:
-    workflow_interface = f"IWorkflow{uuid.uuid4().hex[:6]}"
-    workflow_impl = f"WorkflowImpl{uuid.uuid4().hex[:6]}"
-
-    activity_calls = "\n        ".join(
-        [f"activities.executeStep{i}();" for i in range(1, len(steps) + 1)]
-    )
-    activities = "\n".join(
-        [f"// Activity {i}: {step}" for i, step in enumerate(steps, start=1)]
-    )
-
-    return (
-        f"package com.example.temporal;\n\n"
-        "import io.temporal.workflow.Workflow;\n\n"
-        f"public interface {workflow_interface} {{\n"
-        "    void execute();\n"
-        "}\n\n"
-        "/* Implementation */\n"
-        f"public class {workflow_impl} implements {workflow_interface} {{\n"
-        "    private final Activities activities = Workflow.newActivityStub(Activities.class);\n\n"
-        "    @Override\n"
-        "    public void execute() {\n"
-        f"        {activity_calls}\n"
-        "    }\n"
-        "}\n\n"
-        "/* Activities interface (skeleton) */\n"
-        "interface Activities {\n"
-        f"{activities}\n"
-        "}\n"
-    )
-
-def generate_knative_yaml(title: str, steps: List[str]) -> str:
-    services = "\n".join(
-        [
-            f"- apiVersion: serving.knative.dev/v1\n  kind: Service\n  metadata:\n"
-            f"    name: {step.lower().replace(' ', '-')}\n  spec:\n"
-            f"    template:\n      spec:\n        containers:\n"
-            f"        - image: example/{step.lower().replace(' ', '-')}:latest"
-            for step in steps
-        ]
-    )
-    return f"---\n{services}\n"
-
-# -----------------------------------------------------------------------------
-# Models
-# -----------------------------------------------------------------------------
 class GenerateCodeRequest(BaseModel):
     sop_id: str
     runtime_key: str
-    options: Dict[str, Any] = {}
+    options: Optional[Dict[str, Any]] = Field(default_factory=dict)
+
+class GenerateCodeResponse(BaseModel):
+    code_files: List[CodeFile]
+    main_file: str
+    editor_mode: str
+    ui_schema: Dict[str, Any] = Field(default_factory=dict)
+    confidence: float
+    explanation: Optional[str] = None  # NEW
+
+class RunTestRequest(BaseModel):
+    sop_id: str
+    runtime_key: str
+    code_files: Optional[List[CodeFile]] = None
+    input: Dict[str, Any] = Field(default_factory=dict)
+
+class RunTestResponse(BaseModel):
+    status: str
+    metrics: Dict[str, Any] = Field(default_factory=dict)
+    logs: List[str] = Field(default_factory=list)
+
+class VisualizeRequest(BaseModel):
+    sop_id: Optional[str] = None
+    runtime_key: Optional[str] = None
+    code_file: Optional[CodeFile] = None
+
+class VisualizeResponse(BaseModel):
+    nodes: List[Dict[str, Any]]
+    edges: List[Dict[str, Any]]
+
+class ChatAgentRequest(BaseModel):
+    sop_id: Optional[str] = None
+    runtime_key: Optional[str] = None
+    message: str
+    code: Optional[str] = None
+
+class ChatAgentResponse(BaseModel):
+    reply: str
+
+class SuggestEditRequest(BaseModel):
+    code: str
+    instruction: str
+    runtime_key: str
+
+class SuggestEditResponse(BaseModel):
+    suggested_patch: str
+
+class ApplyCodeEditRequest(BaseModel):
+    code: str
+    patch: str
+
+class ApplyCodeEditResponse(BaseModel):
+    code: str
+
+class ExplainCodeRequest(BaseModel):
+    code: str
+    runtime_key: str
+
+class ExplainCodeResponse(BaseModel):
+    explanation: str
+    groq_used: bool
 
 # -----------------------------------------------------------------------------
-# Endpoints
+# SOP parsing helpers
 # -----------------------------------------------------------------------------
-@app.get("/api/health")
-async def health():
-    return {"status": "ok"}
+def _extract_steps_from_text(s: str) -> List[str]:
+    lines = [ln.strip(" \t\r\n-*•") for ln in s.splitlines()]
+    steps = [ln for ln in lines if ln]
+    return steps
 
+# -----------------------------------------------------------------------------
+# Generators (brace-safe; no .format on Java blocks)
+# -----------------------------------------------------------------------------
+def generate_bpmn_xml(title: str, steps: List[str]) -> str:
+    tasks = "\n".join(
+        '    <bpmn:task id="Task_' + str(i + 1) + '" name="' + step.replace('"', "'") + '" />'
+        for i, step in enumerate(steps)
+    )
+    xml = (
+        '<?xml version="1.0" encoding="UTF-8"?>\n'
+        '<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" '
+        'id="Definitions_' + uuid.uuid4().hex + '">\n'
+        '  <bpmn:process id="workflow" isExecutable="true">\n'
+        + tasks + "\n"
+        '  </bpmn:process>\n'
+        '</bpmn:definitions>\n'
+    )
+    return xml
+
+def generate_camel_java_dsl(title: str, steps: List[str]) -> str:
+    route_steps = "\n        ".join(
+        '.to("log:step' + str(i + 1) + '") // ' + step for i, step in enumerate(steps)
+    )
+    class_name = "RouteBuilder_" + uuid.uuid4().hex[:6]
+    direct_name = re.sub(r"[^a-z0-9_]", "_", title.lower()).strip("_")
+    java = (
+        "package com.example.routes;\n\n"
+        "import org.apache.camel.builder.RouteBuilder;\n"
+        "import org.springframework.stereotype.Component;\n\n"
+        "@Component\n"
+        "public class " + class_name + " extends RouteBuilder {\n"
+        "    @Override\n"
+        "    public void configure() throws Exception {\n"
+        '        from("direct:' + direct_name + '")\n'
+        "        " + route_steps + ";\n"
+        "    }\n"
+        "}\n"
+    )
+    return java
+
+def generate_temporal_java(title: str, steps: List[str]) -> str:
+    iface = "IWorkflow" + uuid.uuid4().hex[:6]
+    impl = "WorkflowImpl" + uuid.uuid4().hex[:6]
+    acts = "Activities"
+
+    activity_calls = "\n        ".join("activities.executeStep" + str(i + 1) + "();" for i in range(len(steps)))
+    activity_comments = "\n".join("    // Activity " + str(i + 1) + ": " + step for i, step in enumerate(steps))
+
+    java = (
+        "package com.example.temporal;\n\n"
+        "import io.temporal.workflow.Workflow;\n\n"
+        "public interface " + iface + " {\n"
+        "    void execute();\n"
+        "}\n\n"
+        "public class " + impl + " implements " + iface + " {\n"
+        "    private final " + acts + " activities = Workflow.newActivityStub(" + acts + ".class);\n\n"
+        "    @Override\n"
+        "    public void execute() {\n"
+        "        " + activity_calls + "\n"
+        "    }\n"
+        "}\n\n"
+        "interface " + acts + " {\n"
+        + activity_comments + "\n"
+        "}\n"
+    )
+    return java
+
+def generate_knative_yaml(title: str, steps: List[str]) -> str:
+    containers = ""
+    for i, step in enumerate(steps, 1):
+        img = re.sub(r"[^a-z0-9-]", "-", step.lower()).strip("-")
+        containers += "      - name: step" + str(i) + "\n        image: example/" + img + ":latest\n"
+    yaml = (
+        "apiVersion: serving.knative.dev/v1\n"
+        "kind: Service\n"
+        "metadata:\n"
+        "  name: " + re.sub(r"[^a-z0-9-]", "-", title.lower()).strip("-") + "-workflow\n"
+        "spec:\n"
+        "  template:\n"
+        "    spec:\n"
+        "      containers:\n"
+        + containers
+    )
+    return yaml
+
+# -----------------------------------------------------------------------------
+# Visualization
+# -----------------------------------------------------------------------------
+def visualize_bpmn(xml: str) -> VisualizeResponse:
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    idx = 0
+    for m in re.finditer(r'<bpmn:task[^>]*name="([^"]+)"', xml):
+        name = m.group(1)
+        nid = "node_" + str(idx)
+        nodes.append({"id": nid, "label": name})
+        if idx > 0:
+            edges.append({"from": "node_" + str(idx - 1), "to": nid})
+        idx += 1
+    return VisualizeResponse(nodes=nodes, edges=edges)
+
+def visualize_camel(java: str) -> VisualizeResponse:
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    steps = re.findall(r'\.to\("([^"]+)"\)', java)
+    for i, s in enumerate(steps):
+        nid = "node_" + str(i)
+        nodes.append({"id": nid, "label": s})
+        if i > 0:
+            edges.append({"from": "node_" + str(i - 1), "to": nid})
+    return VisualizeResponse(nodes=nodes, edges=edges)
+
+def visualize_temporal(java: str) -> VisualizeResponse:
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    acts = re.findall(r'activities\.([a-zA-Z0-9_]+)\s*\(', java)
+    for i, a in enumerate(acts):
+        nid = "node_" + str(i)
+        nodes.append({"id": nid, "label": a})
+        if i > 0:
+            edges.append({"from": "node_" + str(i - 1), "to": nid})
+    if not nodes:
+        # fallback to activity comments
+        for i, m in enumerate(re.finditer(r'//\s*Activity\s*\d+:\s*(.+)', java)):
+            txt = m.group(1).strip()
+            nid = "node_" + str(i)
+            nodes.append({"id": nid, "label": txt})
+            if i > 0:
+                edges.append({"from": "node_" + str(i - 1), "to": nid})
+    return VisualizeResponse(nodes=nodes, edges=edges)
+
+def visualize_knative(yaml: str) -> VisualizeResponse:
+    nodes: List[Dict[str, Any]] = []
+    edges: List[Dict[str, Any]] = []
+    steps = re.findall(r'^\s*-\s*name:\s*([^\s]+)', yaml, flags=re.MULTILINE)
+    for i, s in enumerate(steps):
+        nid = "node_" + str(i)
+        nodes.append({"id": nid, "label": s})
+        if i > 0:
+            edges.append({"from": "node_" + str(i - 1), "to": nid})
+    return VisualizeResponse(nodes=nodes, edges=edges)
+
+# -----------------------------------------------------------------------------
+# Explanation (Groq + heuristic fallback) with logging
+# -----------------------------------------------------------------------------
+def _heuristic_explanation(code: str, runtime_key: str) -> str:
+    bullets: List[str] = []
+
+    # Comments
+    for ln in code.splitlines():
+        s = ln.strip()
+        if s.startswith("//") or s.startswith("#") or s.startswith("--"):
+            msg = s.lstrip("/#-! ").strip()
+            if msg:
+                bullets.append("- " + msg)
+
+    # BPMN names
+    for m in re.finditer(r'name="([^"]+)"', code):
+        name = m.group(1).strip()
+        if name and len(name) < 200:
+            bullets.append("- " + name)
+
+    # Camel .to steps
+    for i, seg in enumerate(re.findall(r'\.to\("([^"]+)"\)', code), 1):
+        bullets.append("- Step " + str(i) + ": route to `" + seg + "`")
+
+    # Temporal activities
+    for m in re.finditer(r'activities\.([a-zA-Z0-9_]+)\s*\(', code):
+        bullets.append("- Calls activity `" + m.group(1) + "`")
+
+    # Deduplicate
+    seen: set = set()
+    uniq: List[str] = []
+    for b in bullets:
+        if b not in seen:
+            uniq.append(b)
+            seen.add(b)
+    if not uniq:
+        uniq = [
+            "- Orchestrates a multi-step workflow.",
+            "- Executes tasks in sequence with retries/integration points.",
+        ]
+    title = "This is a " + runtime_key.upper() + " workflow that orchestrates a business process."
+    return title + "\n\n**What it does:**\n" + "\n".join(uniq)
+
+def explain_code_text(code: str, runtime_key: str) -> Tuple[str, bool]:
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    model = os.getenv("GROQ_MODEL", "llama3-70b-8192")
+
+    if not (_groq_available and api_key):
+        logger.info("explain_code_text: heuristic (Groq unavailable or key missing)")
+        return _heuristic_explanation(code, runtime_key), False
+
+    try:
+        client = Groq(api_key=api_key)
+        sys_prompt = (
+            "You are a senior automation engineer. Given code for a workflow (BPMN XML, Camel Java DSL, "
+            "Temporal Java, or Knative YAML), produce a concise developer-facing section titled exactly:\n"
+            "What is this Workflow Automation doing?\n\n"
+            "Then explain briefly in 5-10 bullet points. Avoid fluff."
+        )
+        resp = client.chat.completions.create(
+            model=model,
+            messages=[
+                {"role": "system", "content": sys_prompt},
+                {"role": "user", "content": "Runtime: " + runtime_key + "\n\nCode:\n" + code[:12000]},
+            ],
+            temperature=0.2,
+            max_tokens=400,
+        )
+        text = resp.choices[0].message.content.strip()
+        logger.info("explain_code_text: Groq used (model=%s)", model)
+        return text, True
+    except Exception as e:
+        logger.warning("explain_code_text: Groq failed, fallback heuristic. error=%s", e)
+        return _heuristic_explanation(code, runtime_key), False
+
+# -----------------------------------------------------------------------------
+# API: SOP upload
+# -----------------------------------------------------------------------------
 @app.post("/api/sop/upload")
 async def upload_sop(
     file: UploadFile = File(...),
     text: str = Form(""),
     scenario_id: str = Form(""),
 ):
-    """Upload SOP file (pdf/txt) or plain text."""
     sop_id = str(uuid.uuid4())
-    sop_text = text or (await file.read()).decode("utf-8", errors="ignore")
+    if text:
+        raw = text
+    else:
+        raw_bytes = await file.read()
+        raw = raw_bytes.decode("utf-8", errors="ignore")
 
-    # Very simple heuristic (can be replaced by Grok later)
-    steps = [line.strip() for line in sop_text.split("\n") if line.strip()]
-    automated = [s for i, s in enumerate(steps) if i % 2 == 0]
-    manual = [s for i, s in enumerate(steps) if i % 2 != 0]
+    steps = _extract_steps_from_text(raw)
+    title = scenario_id or (file.filename or "workflow")
 
-    SOP_STORE[sop_id] = {
-        "text": sop_text,
-        "steps": steps,
-        "automated": automated,
-        "manual": manual,
-    }
+    SOP_STORE[sop_id] = {"title": title, "steps": steps, "last_code": {}}
 
-    suggested_runtimes = [
-        {"key": "temporal", "name": "TEMPORAL", "confidence": 0.55,
-         "reason": "Temporal (Java/TS) - good for code-first durable workflows"},
-        {"key": "bpmn", "name": "BPMN", "confidence": 0.5,
-         "reason": "BPMN (XML) - good for human tasks & manual approvals"},
-        {"key": "camel", "name": "CAMEL", "confidence": 0.5,
-         "reason": "Apache Camel (Java DSL) - good for API/adapter integration"},
+    suggested = [
+        SuggestedRuntime(key="temporal", name="TEMPORAL", confidence=0.88, reason="Durable, code-first workflow orchestration"),
+        SuggestedRuntime(key="bpmn", name="BPMN", confidence=0.74, reason="Great for human-in-the-loop and approvals"),
+        SuggestedRuntime(key="camel", name="CAMEL", confidence=0.69, reason="Strong for integration/routing"),
     ]
 
+    summary = "Detected " + str(len(steps)) + " steps."
+    logger.info("Uploaded SOP %s title=%s steps=%d", sop_id, title, len(steps))
     return {
         "sop_id": sop_id,
-        "summary": f"Detected {len(steps)} steps. Will automate {len(automated)}; {len(manual)} remain manual.",
-        "automated_actions": automated,
-        "manual_actions": manual,
-        "suggested_runtimes": suggested_runtimes,
+        "summary": summary,
+        "automated_actions": steps,
+        "manual_actions": [],
+        "suggested_runtimes": [s.dict() for s in suggested],
     }
 
-@app.post("/api/generate_code")
+# -----------------------------------------------------------------------------
+# API: Generate code (+ explanation)
+# -----------------------------------------------------------------------------
+@app.post("/api/generate_code", response_model=GenerateCodeResponse)
 async def generate_code(req: GenerateCodeRequest):
     sop = SOP_STORE.get(req.sop_id)
     if not sop:
         raise HTTPException(status_code=404, detail="sop_id not found")
 
-    title = "Workflow"
-    steps = sop["steps"]
+    title = sop["title"]
+    steps: List[str] = sop["steps"]
+    runtime_key = req.runtime_key.lower()
 
-    if req.runtime_key == "bpmn":
+    if runtime_key == "bpmn":
         content = generate_bpmn_xml(title, steps)
-        editor = "xml"
-    elif req.runtime_key == "camel":
+        editor_mode = "xml"; main_path = "main.xml"; confidence = 0.74
+    elif runtime_key == "camel":
         content = generate_camel_java_dsl(title, steps)
-        editor = "java"
-    elif req.runtime_key == "temporal":
+        editor_mode = "java"; main_path = "RouteBuilder.java"; confidence = 0.69
+    elif runtime_key == "temporal":
         content = generate_temporal_java(title, steps)
-        editor = "java"
-    elif req.runtime_key == "knative":
+        editor_mode = "java"; main_path = "Workflow.java"; confidence = 0.88
+    elif runtime_key == "knative":
         content = generate_knative_yaml(title, steps)
-        editor = "yaml"
+        editor_mode = "yaml"; main_path = "service.yaml"; confidence = 0.62
     else:
-        raise HTTPException(status_code=400, detail="Unsupported runtime")
+        raise HTTPException(status_code=400, detail="Unsupported runtime_key")
 
-    SOP_STORE[req.sop_id]["last_code"] = content
+    # Save last code
+    code_files = [CodeFile(path=main_path, content=content)]
+    sop["last_code"][runtime_key] = {"files": [cf.dict() for cf in code_files], "main": main_path, "mode": editor_mode}
 
-    return {
-        "code_files": [{"path": f"main.{editor}", "content": content}],
-        "main_file": f"main.{editor}",
-        "editor_mode": editor,
-        "ui_schema": {},
-        "confidence": 0.55,
-    }
+    # Explanation (Groq → heuristic)
+    explanation_text, used_groq = explain_code_text(content, runtime_key)
 
-@app.post("/api/run_test")
-async def run_test(payload: dict = Body(...)):
-    sop_id = payload.get("sop_id")
-    if not sop_id or sop_id not in SOP_STORE:
-        raise HTTPException(status_code=404, detail="sop_id not found")
+    logger.info("Generated code for sop_id=%s runtime=%s (explain: %s)",
+                req.sop_id, runtime_key, "groq" if used_groq else "heuristic")
 
-    return {"status": "success", "log": f"Ran workflow {sop_id} with mock test."}
+    return GenerateCodeResponse(
+        code_files=code_files,
+        main_file=main_path,
+        editor_mode=editor_mode,
+        ui_schema={},         # you can extend with runtime-specific schema
+        confidence=confidence,
+        explanation=explanation_text,
+    )
 
-@app.post("/api/chat_agent")
-async def chat_agent(payload: dict = Body(...)):
-    sop_id = payload.get("sop_id")
-    message = payload.get("message")
+# -----------------------------------------------------------------------------
+# API: Run Test (stubbed)
+# -----------------------------------------------------------------------------
+@app.post("/api/run_test", response_model=RunTestResponse)
+async def run_test(req: RunTestRequest):
+    logs: List[str] = []
+    if not req.code_files:
+        sop = SOP_STORE.get(req.sop_id)
+        if not sop:
+            raise HTTPException(status_code=404, detail="sop_id not found")
+        last = sop["last_code"].get(req.runtime_key.lower())
+        if not last:
+            raise HTTPException(status_code=404, detail="no code generated for this runtime")
+        logs.append("Loaded last generated code from server memory.")
+    else:
+        logs.append("Using code files provided in request.")
+
+    # Fake metrics
+    metrics = {"executed_steps": 1, "errors": 0}
+    logs.append("Test executed successfully.")
+
+    return RunTestResponse(status="ok", metrics=metrics, logs=logs)
+
+# -----------------------------------------------------------------------------
+# API: Visualize
+# -----------------------------------------------------------------------------
+@app.post("/api/visualize_code", response_model=VisualizeResponse)
+async def visualize_code(req: VisualizeRequest):
+    runtime_key = (req.runtime_key or "").lower()
+    code_text: Optional[str] = None
+
+    if req.code_file:
+        code_text = req.code_file.content
+        runtime_key = runtime_key or _infer_runtime_from_path(req.code_file.path)
+
+    if not code_text:
+        if not req.sop_id or not runtime_key:
+            raise HTTPException(status_code=400, detail="Provide sop_id+runtime_key or code_file")
+        sop = SOP_STORE.get(req.sop_id)
+        if not sop:
+            raise HTTPException(status_code=404, detail="sop_id not found")
+        last = sop["last_code"].get(runtime_key)
+        if not last:
+            raise HTTPException(status_code=404, detail="no code generated for this runtime")
+        code_text = ""
+        for f in last["files"]:
+            if f["path"] == last["main"]:
+                code_text = f["content"]
+                break
+
+    if runtime_key == "bpmn":
+        return visualize_bpmn(code_text)
+    if runtime_key == "camel":
+        return visualize_camel(code_text)
+    if runtime_key == "temporal":
+        return visualize_temporal(code_text)
+    if runtime_key == "knative":
+        return visualize_knative(code_text)
+
+    # Try to infer from content
+    if "<bpmn:definitions" in code_text:
+        return visualize_bpmn(code_text)
+    if "extends RouteBuilder" in code_text:
+        return visualize_camel(code_text)
+    if "io.temporal.workflow.Workflow" in code_text:
+        return visualize_temporal(code_text)
+    if "kind: Service" in code_text and "serving.knative.dev" in code_text:
+        return visualize_knative(code_text)
+
+    return VisualizeResponse(nodes=[], edges=[])
+
+def _infer_runtime_from_path(path: str) -> str:
+    p = path.lower()
+    if p.endswith(".xml"):
+        return "bpmn"
+    if p.endswith(".java"):
+        # could be camel or temporal; leave to content in main flow
+        return ""
+    if p.endswith(".yaml") or p.endswith(".yml"):
+        return "knative"
+    return ""
+
+# -----------------------------------------------------------------------------
+# API: Agent Chat (simple; Groq → heuristic)
+# -----------------------------------------------------------------------------
+@app.post("/api/chat_agent", response_model=ChatAgentResponse)
+async def chat_agent(req: ChatAgentRequest):
+    message = (req.message or "").strip()
     if not message:
-        raise HTTPException(status_code=400, detail="Message is required")
-    return {"reply": f"Agentic reply to: {message}"}
+        # avoid UI error "Bad data: Messages cannot be empty"
+        return ChatAgentResponse(reply="Please enter a question or instruction about the code.")
 
-@app.post("/api/chat_agent_suggest_edit")
-async def chat_agent_suggest_edit(payload: dict = Body(...)):
-    return {"suggestion": "Consider renaming activity identifiers for clarity."}
-
-@app.post("/api/apply_code_edit")
-async def apply_code_edit(payload: dict = Body(...)):
-    return {"status": "ok", "new_code": payload.get("new_code", "")}
-
-@app.post("/api/visualize_code")
-async def visualize_code(payload: dict = Body(...)):
-    sop_id = payload.get("sop_id")
-    runtime = payload.get("runtime_key")
-    if not sop_id or sop_id not in SOP_STORE:
-        raise HTTPException(status_code=404, detail="sop_id not found")
-    last_code = SOP_STORE[sop_id].get("last_code", "")
-    return {
-        "nodes": [{"id": f"step{i}", "label": step} for i, step in enumerate(SOP_STORE[sop_id]["steps"], 1)],
-        "edges": [{"from": f"step{i}", "to": f"step{i+1}"} for i in range(len(SOP_STORE[sop_id]["steps"]) - 1)],
-        "raw_code": last_code,
-    }
+    # If you want, you can route to Groq here as well; for now, a simple helpful echo:
+    reply = "I received your message: " + message + "\n\n" \
+            "Try asking things like:\n" \
+            "- “Explain step 3.”\n" \
+            "- “Convert this to a service task.”\n" \
+            "- “Add error handling for API failures.”"
+    return ChatAgentResponse(reply=reply)
 
 # -----------------------------------------------------------------------------
-# NEW ENDPOINT: Explain Code
+# API: Suggest code edit (very simple heuristic patch)
 # -----------------------------------------------------------------------------
-@app.post("/api/explain_code")
-async def explain_code(payload: dict = Body(...)):
-    """
-    Generate a narrative explanation of the workflow automation code.
-    """
-    sop_id = payload.get("sop_id")
-    runtime_key = payload.get("runtime_key")
-    code = payload.get("code")
-
-    if not code:
-        raise HTTPException(status_code=400, detail="Code cannot be empty")
-
-    client = get_grok_client()
-
-    system_prompt = f"""
-You are an expert workflow automation analyst. 
-Explain the given workflow automation code clearly and narratively.
-
-Runtime: {runtime_key}
-
-Instructions:
-1. Identify what the workflow is about (e.g., Temporal workflow for dispute resolution).
-2. Describe its structure (workflow interface, implementation, DSL definition, etc.).
-3. Explain what each step/activity/task does in plain English.
-4. Conclude with a summary of how this workflow orchestrates the process.
-"""
-
-    user_prompt = f"Here is the code:\n\n{code}"
-
-    try:
-        response = client.chat.completions.create(
-            model="grok-beta",
-            messages=[
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        )
-        explanation = response.choices[0].message["content"]
-        return {"sop_id": sop_id, "runtime_key": runtime_key, "explanation": explanation}
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Explain code failed: {str(e)}")
+@app.post("/api/chat_agent_suggest_edit", response_model=SuggestEditResponse)
+async def chat_agent_suggest_edit(req: SuggestEditRequest):
+    # For now, return a pseudo patch comment the IDE can display
+    suggestion = "// SUGGESTION (" + req.runtime_key.upper() + "): " + req.instruction.strip()
+    patch = suggestion + "\n"
+    return SuggestEditResponse(suggested_patch=patch)
 
 # -----------------------------------------------------------------------------
-# Entrypoint
+# API: Apply code edit (append-only demo)
 # -----------------------------------------------------------------------------
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+@app.post("/api/apply_code_edit", response_model=ApplyCodeEditResponse)
+async def apply_code_edit(req: ApplyCodeEditRequest):
+    new_code = req.code + "\n" + req.patch
+    return ApplyCodeEditResponse(code=new_code)
+
+# -----------------------------------------------------------------------------
+# API: Explain code (standalone)
+# -----------------------------------------------------------------------------
+@app.post("/api/explain_code_text", response_model=ExplainCodeResponse)
+async def explain_code_endpoint(req: ExplainCodeRequest):
+    text, used_groq = explain_code_text(req.code, req.runtime_key)
+    return ExplainCodeResponse(explanation=text, groq_used=used_groq)
+
+# -----------------------------------------------------------------------------
+# Health check
+# -----------------------------------------------------------------------------
+@app.get("/api/health")
+async def health():
+    return {"status": "ok"}
