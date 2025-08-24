@@ -358,6 +358,13 @@ public class {workflow_impl} implements {workflow_interface} {{
 /* Activities interface (skeleton) */
 interface Activities {{
 {activities}
+}}
+"""
+
+
+/* Activities interface (skeleton) */
+interface Activities {{
+{activities}
 """
 
 # -------------------------------
