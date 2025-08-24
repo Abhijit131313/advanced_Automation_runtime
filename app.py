@@ -84,7 +84,6 @@ class ChatResponse(BaseModel):
     reply: str
     meta: Optional[Dict[str, Any]] = {}
 
-# Diagram models
 class DiagramNode(BaseModel):
     id: str
     label: str
@@ -100,11 +99,10 @@ class DiagramResponse(BaseModel):
     edges: List[DiagramEdge]
     meta: Optional[Dict[str, Any]] = {}
 
-# Agentic editor models
 class ChatEditRequest(BaseModel):
     sop_id: str
     message: str
-    target_file: Optional[str] = None  # optional hint
+    target_file: Optional[str] = None
 
 class ChatEditSuggestion(BaseModel):
     path: str
@@ -132,7 +130,6 @@ class ApplyCodeEditResponse(BaseModel):
 # Helpers: SOP parsing & AI calls
 # -------------------------------
 def extract_steps_from_text(text: str) -> List[str]:
-    """Extract bullet/numbered/short lines as steps; fallback to paragraphs."""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     steps: List[str] = []
     for ln in lines:
@@ -152,18 +149,9 @@ def extract_steps_from_text(text: str) -> List[str]:
     return steps
 
 async def call_ai_model(prompt: str, max_tokens: int = 1200, temperature: float = 0.0) -> str:
-    """Generic AI caller; returns provider content or 'LLM_NOT_CONFIGURED'."""
     if GROK_API_URL and GROK_API_KEY:
-        headers = {
-            "Authorization": f"Bearer {GROK_API_KEY}",
-            "Content-Type": "application/json",
-        }
-        payload = {
-            "model": DEFAULT_MODEL,
-            "prompt": prompt,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-        }
+        headers = {"Authorization": "Bearer {k}".format(k=GROK_API_KEY), "Content-Type": "application/json"}
+        payload = {"model": DEFAULT_MODEL, "prompt": prompt, "max_tokens": max_tokens, "temperature": temperature}
         async with aiohttp.ClientSession() as session:
             async with session.post(GROK_API_URL, headers=headers, json=payload, timeout=60) as resp:
                 text = await resp.text()
@@ -172,7 +160,7 @@ async def call_ai_model(prompt: str, max_tokens: int = 1200, temperature: float 
                     if isinstance(j, dict):
                         if "choices" in j and j["choices"]:
                             c = j["choices"][0]
-                            return c.get("text") or c.get("message", {}).get("content") or str(c)
+                            return c.get("text") or (c.get("message") or {}).get("content") or str(c)
                         if "output" in j:
                             return j["output"]
                     return str(j)
@@ -182,7 +170,6 @@ async def call_ai_model(prompt: str, max_tokens: int = 1200, temperature: float 
     return "LLM_NOT_CONFIGURED"
 
 def heuristic_suggest_runtimes(steps: List[str]) -> List[SuggestedRuntime]:
-    """Deterministic fallback if LLM fails."""
     text = " ".join(steps).lower()
     scores = {
         "bpmn": 0.5 + (0.1 if any(k in text for k in ["manual", "approval", "human"]) else 0.0),
@@ -197,18 +184,12 @@ def heuristic_suggest_runtimes(steps: List[str]) -> List[SuggestedRuntime]:
         "temporal": "Temporal (Java/TS) - good for code-first durable workflows",
     }
     suggested = [
-        SuggestedRuntime(
-            key=k,
-            name=k.upper(),
-            confidence=round(min(0.99, v), 2),
-            reason=mapping[k],
-        )
+        SuggestedRuntime(key=k, name=k.upper(), confidence=round(min(0.99, v), 2), reason=mapping[k])
         for k, v in scores.items()
     ]
     return sorted(suggested, key=lambda s: s.confidence, reverse=True)[:3]
 
 async def ai_suggest_runtimes(steps: List[str]) -> List[SuggestedRuntime]:
-    """LLM-first runtime ranking. Returns [] on failure to trigger fallback."""
     prompt = (
         "You are an automation advisor. Given the following SOP steps, return a JSON array of the top 3 "
         "recommended automation runtimes. Each item MUST have keys: "
@@ -216,7 +197,7 @@ async def ai_suggest_runtimes(steps: List[str]) -> List[SuggestedRuntime]:
         "Output VALID JSON array only (no extra commentary).\n\nSOP Steps:\n"
     )
     for i, s in enumerate(steps, start=1):
-        prompt += f"{i}. {s}\n"
+        prompt += "{i}. {s}\n".format(i=i, s=s)
     prompt += (
         '\nExample: [{"key":"bpmn","name":"BPMN","confidence":0.92,"reason":"best for human approvals"},'
         '{"key":"camel","name":"Apache Camel","confidence":0.82,"reason":"API integrations"},'
@@ -227,19 +208,14 @@ async def ai_suggest_runtimes(steps: List[str]) -> List[SuggestedRuntime]:
     if not ai_text or ai_text.strip() == "LLM_NOT_CONFIGURED":
         return []
 
-    start = ai_text.find("[")
-    end = ai_text.rfind("]")
+    start = ai_text.find("["); end = ai_text.rfind("]")
     parsed = None
     if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(ai_text[start : end + 1])
-        except Exception:
-            parsed = None
+        try: parsed = json.loads(ai_text[start:end+1])
+        except Exception: parsed = None
     if parsed is None:
-        try:
-            parsed = json.loads(ai_text)
-        except Exception:
-            parsed = None
+        try: parsed = json.loads(ai_text)
+        except Exception: parsed = None
     if not isinstance(parsed, list) or not parsed:
         return []
 
@@ -261,43 +237,34 @@ async def ai_suggest_runtimes(steps: List[str]) -> List[SuggestedRuntime]:
         k = k.strip().lower()
         if k not in allowed:
             continue
-        out.append(
-            SuggestedRuntime(
-                key=k,
-                name=str(name),
-                confidence=round(max(0.0, min(0.99, conf)), 2),
-                reason=str(reason),
-            )
-        )
+        out.append(SuggestedRuntime(
+            key=k, name=str(name),
+            confidence=round(max(0.0, min(0.99, conf)), 2),
+            reason=str(reason)
+        ))
     return out
 
 async def ai_summarize_sop(steps: List[str]) -> Tuple[Optional[str], Optional[List[str]], Optional[List[str]]]:
-    """LLM-first SOP summary + automated/manual lists. Returns (None, None, None) on failure."""
     prompt = (
         "You are an automation analyst. Given the numbered SOP steps below, return a JSON object with keys:\n"
         "  summary (1-3 sentences), automated_actions (array of step texts), manual_actions (array of step texts).\n"
         "Output ONLY valid JSON (no commentary).\n\nSteps:\n"
     )
     for i, s in enumerate(steps, start=1):
-        prompt += f"{i}. {s}\n"
+        prompt += "{i}. {s}\n".format(i=i, s=s)
 
     ai_text = await call_ai_model(prompt, max_tokens=800, temperature=0.0)
     if not ai_text or ai_text.strip() == "LLM_NOT_CONFIGURED":
         return None, None, None
 
-    start = ai_text.find("{")
-    end = ai_text.rfind("}")
+    start = ai_text.find("{"); end = ai_text.rfind("}")
     parsed = None
     if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(ai_text[start : end + 1])
-        except Exception:
-            parsed = None
+        try: parsed = json.loads(ai_text[start:end+1])
+        except Exception: parsed = None
     if parsed is None:
-        try:
-            parsed = json.loads(ai_text)
-        except Exception:
-            parsed = None
+        try: parsed = json.loads(ai_text)
+        except Exception: parsed = None
     if not isinstance(parsed, dict):
         return None, None, None
 
@@ -311,7 +278,6 @@ async def ai_summarize_sop(steps: List[str]) -> Tuple[Optional[str], Optional[Li
     return str(summary), [str(x) for x in automated], [str(x) for x in manual]
 
 def build_summary_and_action_split(steps: List[str]) -> Tuple[str, List[str], List[str]]:
-    """Heuristic fallback for summary + split."""
     automated: List[str] = []
     manual: List[str] = []
     for s in steps:
@@ -320,14 +286,16 @@ def build_summary_and_action_split(steps: List[str]) -> Tuple[str, List[str], Li
             manual.append(s)
         else:
             automated.append(s)
-    summary = f"Detected {len(steps)} steps. Will automate {len(automated)}; {len(manual)} remain manual."
+    summary = "Detected {n} steps. Will automate {a}; {m} remain manual.".format(
+        n=len(steps), a=len(automated), m=len(manual)
+    )
     return summary, automated, manual
 
 # -------------------------------
 # Code generation templates
 # -------------------------------
 def generate_bpmn_xml(sop_title: str, steps: List[str]) -> str:
-    process_id = f"proc_{uuid.uuid4().hex[:8]}"
+    process_id = "proc_{s}".format(s=uuid.uuid4().hex[:8])
     tasks_xml = ""
     for i, step in enumerate(steps, start=1):
         tasks_xml += '    <userTask id="task_{i}" name="{name}" />\n'.format(
@@ -343,16 +311,16 @@ def generate_bpmn_xml(sop_title: str, steps: List[str]) -> str:
     return xml
 
 def generate_camel_java_dsl(sop_title: str, steps: List[str]) -> str:
-    class_name = "RouteBuilder_{suffix}".format(suffix=uuid.uuid4().hex[:6])
+    class_name = "RouteBuilder_{s}".format(s=uuid.uuid4().hex[:6])
     route_steps = ""
     for i, s in enumerate(steps, start=1):
         if any(k in s.lower() for k in ["http", "api", "post", "get"]):
-            route_steps += '            .to("http://external.api/endpoint") // step {i}: {comment}\n'.format(
-                i=i, comment=escape_java_comment(s)
+            route_steps += '            .to("http://external.api/endpoint") // step {i}: {c}\n'.format(
+                i=i, c=escape_java_comment(s)
             )
         else:
-            route_steps += '            .to("log:step{i}") // step {i}: {comment}\n'.format(
-                i=i, comment=escape_java_comment(s)
+            route_steps += '            .to("log:step{i}") // step {i}: {c}\n'.format(
+                i=i, c=escape_java_comment(s)
             )
     java = (
         "package com.example.routes;\n\n"
@@ -370,7 +338,7 @@ def generate_camel_java_dsl(sop_title: str, steps: List[str]) -> str:
     return java
 
 def generate_knative_yaml(sop_title: str, steps: List[str]) -> str:
-    name = "workbench-{suffix}".format(suffix=uuid.uuid4().hex[:6])
+    name = "workbench-{s}".format(s=uuid.uuid4().hex[:6])
     yaml = (
         "apiVersion: serving.knative.dev/v1\n"
         "kind: Service\n"
@@ -384,18 +352,16 @@ def generate_knative_yaml(sop_title: str, steps: List[str]) -> str:
         "        env:\n"
     ).format(name=name)
     for i, s in enumerate(steps, start=1):
-        yaml += '        - name: STEP_{i}\n          value: "{val}"\n'.format(
-            i=i, val=escape_yaml(s[:120])
-        )
+        yaml += '        - name: STEP_{i}\n          value: "{v}"\n'.format(i=i, v=escape_yaml(s[:120]))
     return yaml
 
 def generate_temporal_java(sop_title: str, steps: List[str]) -> str:
-    workflow_interface = "IWorkflow{suffix}".format(suffix=uuid.uuid4().hex[:6])
-    workflow_impl = "WorkflowImpl{suffix}".format(suffix=uuid.uuid4().hex[:6])
+    workflow_interface = "IWorkflow{s}".format(s=uuid.uuid4().hex[:6])
+    workflow_impl = "WorkflowImpl{s}".format(s=uuid.uuid4().hex[:6])
     activities = ""
     activity_calls = ""
     for i, s in enumerate(steps, start=1):
-        activities += "    // Activity {i}: {comment}\n".format(i=i, comment=escape_java_comment(s))
+        activities += "    // Activity {i}: {c}\n".format(i=i, c=escape_java_comment(s))
         activity_calls += "        activities.executeStep{idx}();\n".format(idx=i)
 
     java = (
@@ -409,19 +375,14 @@ def generate_temporal_java(sop_title: str, steps: List[str]) -> str:
         "    private final Activities activities = Workflow.newActivityStub(Activities.class);\n\n"
         "    @Override\n"
         "    public void execute() {{\n"
-        "{activity_calls}"
+        "{calls}"
         "    }\n"
         "}\n\n"
         "/* Activities interface (skeleton) */\n"
         "interface Activities {{\n"
-        "{activities}"
+        "{acts}"
         "}\n"
-    ).format(
-        iface=workflow_interface,
-        impl=workflow_impl,
-        activity_calls=activity_calls,
-        activities=activities,
-    )
+    ).format(iface=workflow_interface, impl=workflow_impl, calls=activity_calls, acts=activities)
     return java
 
 # -------------------------------
@@ -473,7 +434,7 @@ def visualize_camel_from_java(java_str: str) -> DiagramResponse:
     try:
         m = re.search(r'from\(\s*["\']([^"\']+)["\']\s*\)', java_str)
         src = m.group(1) if m else "direct:start"
-        src_id = "from::{src}".format(src=src)
+        src_id = "from::{s}".format(s=src)
         nodes.append(DiagramNode(id=src_id, label=src, type="endpoint"))
         tos = re.findall(r'\.to\(\s*["\']([^"\']+)["\']\s*\)', java_str)
         prev = src_id
@@ -490,9 +451,7 @@ def visualize_knative_from_yaml(yaml_str: str) -> DiagramResponse:
     nodes: List[DiagramNode] = []
     edges: List[DiagramEdge] = []
     try:
-        matches = re.findall(
-            r'(?m)^\s*- name:\s*STEP_(\d+)\s*\n\s*value:\s*["\']?([^"\']+)["\']?', yaml_str
-        )
+        matches = re.findall(r'(?m)^\s*- name:\s*STEP_(\d+)\s*\n\s*value:\s*["\']?([^"\']+)["\']?', yaml_str)
         prev = None
         for idx, val in sorted(matches, key=lambda x: int(x[0])):
             nid = "step_{i}".format(i=idx)
@@ -529,7 +488,6 @@ def visualize_temporal_from_java(java_str: str) -> DiagramResponse:
     return DiagramResponse(nodes=nodes, edges=edges, meta={"runtime": "temporal"})
 
 def visualize_generated_code(code_files: List[Dict[str, Any]], runtime_key: str) -> DiagramResponse:
-    """Pick best file and parse into a simple graph model."""
     content = ""
     preferred = {
         "bpmn": ["process.bpmn", "process.xml", ".bpmn", ".xml"],
@@ -542,17 +500,13 @@ def visualize_generated_code(code_files: List[Dict[str, Any]], runtime_key: str)
         path = cf.get("path", "")
         cnt = cf.get("content", "") or ""
         if rk == "bpmn" and any(p in path for p in preferred["bpmn"]):
-            content = cnt
-            break
+            content = cnt; break
         if rk == "camel" and any(p in path for p in preferred["camel"]):
-            content = cnt
-            break
+            content = cnt; break
         if rk == "knative" and any(p in path for p in preferred["knative"]):
-            content = cnt
-            break
+            content = cnt; break
         if rk == "temporal" and any(p in path for p in preferred["temporal"]):
-            content = cnt
-            break
+            content = cnt; break
     if not content and code_files:
         content = code_files[0].get("content", "")
 
@@ -578,7 +532,6 @@ async def upload_sop(
     text: Optional[str] = Form(None),
     scenario_id: Optional[str] = Form(None),
 ):
-    # Upload SOP and return summary, auto vs manual steps, and top-3 runtime suggestions.
     if not file and not text:
         raise HTTPException(status_code=400, detail="file or text required")
 
@@ -636,7 +589,6 @@ async def upload_sop(
 
 @app.post("/api/generate_code", response_model=GenerateCodeResponse)
 async def generate_code(req: GenerateCodeRequest):
-    # Generate runtime-specific code; use LLM first, else templates.
     sop = STORE.get(req.sop_id)
     if not sop:
         raise HTTPException(status_code=404, detail="sop_id not found")
@@ -660,17 +612,13 @@ async def generate_code(req: GenerateCodeRequest):
     if use_llm and len(ai_response) > 50:
         path = "automation_{rt}.txt".format(rt=runtime)
         if runtime == "bpmn":
-            path = "process.bpmn"
-            editor_mode = "xml"
+            path = "process.bpmn"; editor_mode = "xml"
         elif runtime == "camel":
-            path = "RouteBuilder.java"
-            editor_mode = "java"
+            path = "RouteBuilder.java"; editor_mode = "java"
         elif runtime == "knative":
-            path = "service.yaml"
-            editor_mode = "yaml"
+            path = "service.yaml"; editor_mode = "yaml"
         elif runtime == "temporal":
-            path = "workflow.java"
-            editor_mode = "java"
+            path = "workflow.java"; editor_mode = "java"
         code_files.append(CodeFile(path=path, content=ai_response))
         confidence = 0.85
     else:
@@ -678,27 +626,22 @@ async def generate_code(req: GenerateCodeRequest):
         if runtime == "bpmn":
             content = generate_bpmn_xml(title, steps)
             code_files.append(CodeFile(path="process.bpmn", content=content))
-            editor_mode = "xml"
-            confidence = 0.9
+            editor_mode = "xml"; confidence = 0.9
         elif runtime == "camel":
             content = generate_camel_java_dsl(title, steps)
             code_files.append(CodeFile(path="RouteBuilder.java", content=content))
-            editor_mode = "java"
-            confidence = 0.88
+            editor_mode = "java"; confidence = 0.88
         elif runtime == "knative":
             content = generate_knative_yaml(title, steps)
             code_files.append(CodeFile(path="service.yaml", content=content))
-            editor_mode = "yaml"
-            confidence = 0.82
+            editor_mode = "yaml"; confidence = 0.82
         elif runtime == "temporal":
             content = generate_temporal_java(title, steps)
             code_files.append(CodeFile(path="workflow.java", content=content))
-            editor_mode = "java"
-            confidence = 0.86
+            editor_mode = "java"; confidence = 0.86
         else:
             code_files.append(CodeFile(path="automation.txt", content="// Unsupported runtime"))
-            editor_mode = "text"
-            confidence = 0.5
+            editor_mode = "text"; confidence = 0.5
 
     # Simple UI schema inference
     ui_schema: Dict[str, Any] = {"title": title, "fields": []}
@@ -729,7 +672,6 @@ async def generate_code(req: GenerateCodeRequest):
 
 @app.post("/api/run_test", response_model=RunTestResponse)
 async def run_test(req: RunTestRequest):
-    # Simple dry-run/simulation trace.
     if req.sop_id not in STORE:
         raise HTTPException(status_code=404, detail="sop_id not found")
     steps = STORE[req.sop_id].get("steps", [])
@@ -748,7 +690,6 @@ async def run_test(req: RunTestRequest):
 
 @app.post("/api/chat_agent", response_model=ChatResponse)
 async def chat_agent(req: ChatRequest):
-    # Contextual agent chat over SOP text.
     sop = STORE.get(req.sop_id)
     context = sop.get("sop_text") if sop else ""
     prompt = "Context SOP:\n{ctx}\n\nUser: {msg}\nAssistant:".format(ctx=context, msg=req.message)
@@ -759,7 +700,6 @@ async def chat_agent(req: ChatRequest):
         reply = ai_response
     return ChatResponse(reply=reply, meta={"model_used": DEFAULT_MODEL})
 
-# -------- Agentic editor: suggest & apply code edits --------
 async def ai_suggest_code_edit(sop_id: str, user_message: str, target_file: Optional[str] = None) -> Optional[ChatEditSuggestion]:
     sop = STORE.get(sop_id)
     if not sop:
@@ -788,19 +728,14 @@ async def ai_suggest_code_edit(sop_id: str, user_message: str, target_file: Opti
     if not ai_text or ai_text.strip() == "LLM_NOT_CONFIGURED":
         return None
 
-    start = ai_text.find("{")
-    end = ai_text.rfind("}")
+    start = ai_text.find("{"); end = ai_text.rfind("}")
     parsed = None
     if start != -1 and end != -1 and end > start:
-        try:
-            parsed = json.loads(ai_text[start : end + 1])
-        except Exception:
-            parsed = None
+        try: parsed = json.loads(ai_text[start:end+1])
+        except Exception: parsed = None
     if parsed is None:
-        try:
-            parsed = json.loads(ai_text)
-        except Exception:
-            parsed = None
+        try: parsed = json.loads(ai_text)
+        except Exception: parsed = None
     if not isinstance(parsed, dict):
         return None
 
@@ -814,7 +749,6 @@ async def ai_suggest_code_edit(sop_id: str, user_message: str, target_file: Opti
 
 @app.post("/api/chat_agent_suggest_edit", response_model=ChatEditResponse)
 async def chat_agent_suggest_edit(req: ChatEditRequest):
-    # Return a textual reply and (if available) a structured edit suggestion.
     base_reply = ""
     try:
         sop = STORE.get(req.sop_id)
@@ -836,7 +770,6 @@ async def chat_agent_suggest_edit(req: ChatEditRequest):
 
 @app.post("/api/apply_code_edit", response_model=ApplyCodeEditResponse)
 async def apply_code_edit(req: ApplyCodeEditRequest):
-    # Replace or add file in last_generated and create a simple version record.
     if req.sop_id not in STORE:
         raise HTTPException(status_code=404, detail="sop_id not found")
     last = STORE[req.sop_id].get("last_generated")
