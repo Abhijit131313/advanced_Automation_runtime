@@ -1,329 +1,65 @@
+# app.py
 import os
 import io
-import uuid
 import json
+import uuid
 import logging
 from typing import List, Optional, Dict, Any, Tuple
-from string import Template
 
-from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Request
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException, Body
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
+from pydantic import BaseModel
+from starlette.responses import JSONResponse
 
-from pydantic import BaseModel, Field
-
-# Optional Grok (Groq) import — only used if key is provided
-try:
-    from groq import Groq
-except Exception:
-    Groq = None  # type: ignore
+import aiohttp
+import asyncio
+import yaml
 
 # -----------------------------------------------------------------------------
-# Logging
-# -----------------------------------------------------------------------------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("workbench-backend")
-
-# -----------------------------------------------------------------------------
-# FastAPI app
+# App setup & logger
 # -----------------------------------------------------------------------------
 app = FastAPI(title="Workbench Studio Backend", version="0.1.0")
+logger = logging.getLogger("workbench-backend")
+logging.basicConfig(level=logging.INFO, format="%(levelname)s:%(name)s:%(message)s")
 
-# CORS (allow Bolt and localhost)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # lock this down later if needed
+    allow_origins=["*"],   # scope-reduce for prod
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
 # -----------------------------------------------------------------------------
-# In-memory stores (simple demo; replace with DB in production)
+# In-memory stores (simple demo persistence)
 # -----------------------------------------------------------------------------
-SOPS: Dict[str, Dict[str, Any]] = {}
-# SOPS[sop_id] = {
+# sop_store[sop_id] = {
 #   "title": str,
-#   "text": str,
-#   "steps": List[str],
+#   "text": str,             # parsed text
+#   "steps": [str, ...],     # recognized steps
+#   "suggested_runtimes": [...],
 # }
+sop_store: Dict[str, Dict[str, Any]] = {}
 
-SESSIONS: Dict[str, Dict[str, Any]] = {}
-# SESSIONS[sop_id] = {
-#   "runtime_key": str,
-#   "code_files": List[{"path": str, "content": str}],
+# generated_code_store[sop_id] = {
+#   "runtime": str,
+#   "code_files": [{"path": str, "content": str}],
 #   "main_file": str,
 #   "editor_mode": str,
-#   "explanation": Optional[str],
+#   "ui_schema": dict,
+#   "confidence": float,
 # }
+generated_code_store: Dict[str, Dict[str, Any]] = {}
 
 # -----------------------------------------------------------------------------
-# Helpers
+# Config (Grok / xAI)
 # -----------------------------------------------------------------------------
-def parse_sop_text(text: str) -> Tuple[str, List[str]]:
-    """
-    Parse SOP text into (title, steps).
-    First non-empty line becomes title. Remaining non-empty lines become steps.
-    """
-    if not text:
-        return ("Untitled Scenario", [])
-    lines = [ln.strip() for ln in text.splitlines()]
-    lines = [ln for ln in lines if ln]  # drop empties
-    if not lines:
-        return ("Untitled Scenario", [])
-    title = lines[0]
-    # Treat remaining lines that look like bullets or sentences as steps
-    bullets = []
-    for ln in lines[1:]:
-        # strip bullet markers
-        cleaned = ln
-        for pfx in ["-", "*", "•", "1.", "2.", "3."]:
-            if cleaned.startswith(pfx):
-                cleaned = cleaned[len(pfx):].strip()
-        if cleaned:
-            bullets.append(cleaned)
-    if not bullets:  # If no bullets: use remaining lines
-        bullets = lines[1:]
-    return (title, bullets)
-
-
-def suggested_runtimes_for_steps(steps: List[str]) -> List[Dict[str, Any]]:
-    """
-    Return 3 runtime suggestions with confidence & reasons.
-    Very simple heuristic for demo.
-    """
-    n = len(steps)
-    out = [
-        {"key": "temporal", "name": "TEMPORAL", "confidence": 0.55, "reason": "Temporal (Java/TS) - code-first durable workflows"},
-        {"key": "bpmn", "name": "BPMN", "confidence": 0.50, "reason": "BPMN (XML) - human tasks & approvals"},
-        {"key": "camel", "name": "CAMEL", "confidence": 0.50, "reason": "Apache Camel (Java DSL) - routing, adapters, APIs"},
-    ]
-    if n <= 2:
-        out[1]["confidence"] = 0.52
-        out[2]["confidence"] = 0.48
-    elif n >= 8:
-        out[0]["confidence"] = 0.60
-    return out
-
-
-def render_template(tpl: str, **kwargs) -> str:
-    """Use $placeholders to avoid Python brace conflicts in Java/XML/YAML."""
-    return Template(tpl).safe_substitute(**kwargs)
-
-
-def generate_bpmn_xml(title: str, steps: List[str]) -> str:
-    """
-    Generates a minimal BPMN XML diagram with sequential tasks.
-    """
-    tasks_xml = []
-    seq_flows = []
-    last_id = "startEvent_1"
-    for idx, step in enumerate(steps, start=1):
-        task_id = f"Task_{idx}"
-        tasks_xml.append(
-            f'<bpmn:task id="{task_id}" name="{step}"/>'
-        )
-        seq_id = f"Flow_{idx}"
-        seq_flows.append(
-            f'<bpmn:sequenceFlow id="{seq_id}" sourceRef="{last_id}" targetRef="{task_id}"/>'
-        )
-        last_id = task_id
-
-    # end event
-    tasks_xml.append('<bpmn:endEvent id="endEvent_1" name="End"/>')
-    seq_flows.append(f'<bpmn:sequenceFlow id="Flow_end" sourceRef="{last_id}" targetRef="endEvent_1"/>')
-
-    xml = f"""<?xml version="1.0" encoding="UTF-8"?>
-<bpmn:definitions xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
-                  xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL"
-                  id="Definitions_1" targetNamespace="http://example.com/bpmn">
-  <bpmn:process id="Process_1" name="{title}" isExecutable="true">
-    <bpmn:startEvent id="startEvent_1" name="Start"/>
-    {''.join(tasks_xml)}
-    {''.join(seq_flows)}
-  </bpmn:process>
-</bpmn:definitions>
-"""
-    return xml
-
-
-def generate_camel_java_dsl(title: str, steps: List[str]) -> str:
-    """
-    Generates a simple Camel RouteBuilder class in Java DSL.
-    """
-    route_steps = []
-    for idx, step in enumerate(steps, start=1):
-        # Represent each step as a log statement; real impl would add processors/components
-        route_steps.append(f'            .process(exchange -> System.out.println("Step {idx}: {step}"))\n')
-
-    tpl = """package com.example.camel;
-
-import org.apache.camel.builder.RouteBuilder;
-
-public class ${CLS} extends RouteBuilder {
-    @Override
-    public void configure() throws Exception {
-        from("timer:${lower}?period=60000")
-            .routeId("${CLS}Route")
-${steps}            .to("log:${lower}?level=INFO");
-    }
-}
-"""
-    class_name = "Route" + uuid.uuid4().hex[:8]
-    return render_template(
-        tpl,
-        CLS=class_name,
-        lower=class_name.lower(),
-        steps="".join(route_steps),
-    )
-
-
-def generate_temporal_java(title: str, steps: List[str]) -> str:
-    """
-    Generates a minimal Temporal workflow & activities (Java).
-    """
-    activity_comments = []
-    activity_calls = []
-    for idx, step in enumerate(steps, start=1):
-        activity_comments.append(f"    // Activity {idx}: {step}\n")
-        activity_calls.append(f"        activities.executeStep{idx}();\n")
-
-    workflow_interface = "IWorkflow" + uuid.uuid4().hex[:6]
-    workflow_impl = "WorkflowImpl" + uuid.uuid4().hex[:6]
-
-    tpl = """package com.example.temporal;
-
-import io.temporal.workflow.Workflow;
-
-public interface ${IFACE} {
-    void execute();
-}
-
-/* Implementation */
-public class ${IMPL} implements ${IFACE} {
-    private final Activities activities = Workflow.newActivityStub(Activities.class);
-
-    @Override
-    public void execute() {
-${calls}    }
-}
-
-/* Activities interface (skeleton) */
-interface Activities {
-${acts}}
-"""
-    return render_template(
-        tpl,
-        IFACE=workflow_interface,
-        IMPL=workflow_impl,
-        calls="".join(activity_calls),
-        acts="".join(activity_comments),
-    )
-
-
-def generate_knative_yaml(title: str, steps: List[str]) -> str:
-    """
-    Generates a simplistic Knative-like YAML (pseudo for demo).
-    """
-    tasks_yaml = []
-    for idx, step in enumerate(steps, start=1):
-        tasks_yaml.append(f"  - name: step{idx}\n    image: example/worker:latest\n    args: [\"{step}\"]\n")
-    tpl = """apiVersion: serving.knative.dev/v1
-kind: Service
-metadata:
-  name: ${name}
-spec:
-  template:
-    spec:
-      containers:
-${tasks}
-"""
-    name = "svc-" + uuid.uuid4().hex[:6]
-    return render_template(tpl, name=name, tasks="".join(tasks_yaml))
-
-
-def detect_editor_mode(runtime_key: str) -> str:
-    rk = (runtime_key or "").lower()
-    if rk == "bpmn":
-        return "xml"
-    if rk == "camel":
-        return "java"
-    if rk == "knative":
-        return "yaml"
-    if rk == "temporal":
-        return "java"
-    return "text"
-
-
-def grok_client() -> Optional[Any]:
-    """
-    Return a Grok (Groq) client or None if unavailable or no key present.
-    NOTE: Do NOT pass 'proxies' — the SDK doesn't accept it (fix for your earlier error).
-    """
-    key = os.getenv("GROK_API_KEY") or os.getenv("GROQ_API_KEY")
-    if not key or Groq is None:
-        logger.info("explain_code_text: no GROK_API_KEY or groq lib missing; will use heuristic")
-        return None
-    try:
-        client = Groq(api_key=key)  # no proxies!
-        return client
-    except Exception as e:
-        logger.info(f"explain_code_text: grok client init failed ({e}); will use heuristic")
-        return None
-
-
-def explain_with_grok(runtime_key: Optional[str], editor_mode: Optional[str], main_file_content: str) -> Optional[str]:
-    client = grok_client()
-    if client is None:
-        return None
-    try:
-        prompt = (
-            "Explain in clear non-technical language what the following automation workflow does, "
-            "step by step, referencing business intent. Keep it concise but comprehensive.\n\n"
-            f"Runtime: {runtime_key or 'unknown'}\n"
-            f"Editor Mode: {editor_mode or 'unknown'}\n"
-            "Main file content:\n"
-            "----------------------------------------\n"
-            f"{main_file_content[:4000]}\n"
-            "----------------------------------------\n"
-        )
-        resp = client.chat.completions.create(
-            model=os.getenv("GROK_MODEL", "llama-3.3-70b-versatile"),
-            messages=[
-                {"role": "system", "content": "You explain automation workflows for process designers."},
-                {"role": "user", "content": prompt},
-            ],
-            temperature=0.2,
-        )
-        txt = resp.choices[0].message.content.strip()
-        logger.info("explain_code_text: grok success")
-        return txt
-    except Exception as e:
-        logger.info(f"explain_code_text: grok failed ({e}); falling back to heuristic")
-        return None
-
-
-def heuristic_explanation(runtime_key: Optional[str], editor_mode: Optional[str], main_file: Optional[str], code_files: List[Dict[str, str]]) -> str:
-    bullets = []
-    if runtime_key:
-        bullets.append(f"Runtime: {runtime_key.upper()}")
-    if editor_mode:
-        bullets.append(f"Editor: {editor_mode}")
-    if main_file:
-        bullets.append(f"Main file: {main_file}")
-    try:
-        bullets.append("Files in bundle: " + ", ".join([cf["path"] for cf in code_files]))
-    except Exception:
-        pass
-    return (
-        "This automation defines a workflow and executes its steps in order. "
-        "It orchestrates the business process by invoking each activity/task and ensuring state transitions.\n\n"
-        + "\n".join(f"- {b}" for b in bullets)
-        + "\n\nNote: A detailed explanation could not be generated via Grok; this is a heuristic summary."
-    )
+GROK_API_KEY = os.getenv("GROK_API_KEY", "").strip()
+GROK_API_URL = os.getenv("GROK_API_URL", "https://api.x.ai/v1/chat/completions").strip()
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5").strip()
 
 # -----------------------------------------------------------------------------
-# Schemas
+# Pydantic models
 # -----------------------------------------------------------------------------
 class UploadSOPResponse(BaseModel):
     sop_id: str
@@ -332,17 +68,14 @@ class UploadSOPResponse(BaseModel):
     manual_actions: List[str]
     suggested_runtimes: List[Dict[str, Any]]
 
-
 class GenerateCodeRequest(BaseModel):
     sop_id: str
     runtime_key: str
     options: Optional[Dict[str, Any]] = None
 
-
 class CodeFile(BaseModel):
     path: str
     content: str
-
 
 class GenerateCodeResponse(BaseModel):
     code_files: List[CodeFile]
@@ -351,53 +84,327 @@ class GenerateCodeResponse(BaseModel):
     ui_schema: Dict[str, Any]
     confidence: float
 
+class RunTestRequest(BaseModel):
+    sop_id: str
+    code: Optional[str] = None
+    runtime: Optional[str] = None
+    input: Optional[Dict[str, Any]] = None
+
+class RunTestResponse(BaseModel):
+    ok: bool
+    logs: List[str]
+    output: Dict[str, Any]
 
 class VisualizeRequest(BaseModel):
+    sop_id: str
+    code: Optional[str] = None
+    runtime: Optional[str] = None
+
+class VisualizeResponse(BaseModel):
+    nodes: List[Dict[str, Any]]
+    edges: List[Dict[str, Any]]
+
+class ChatAgentRequest(BaseModel):
     sop_id: Optional[str] = None
-    runtime_key: Optional[str] = None
-    code_files: Optional[List[CodeFile]] = None
-    main_file: Optional[str] = None
+    messages: List[Dict[str, str]]
 
-
-class RunTestRequest(BaseModel):
-    sop_id: Optional[str] = None
-    runtime_key: Optional[str] = None
-    code_files: Optional[List[CodeFile]] = None
-    main_file: Optional[str] = None
-    inputs: Optional[Dict[str, Any]] = None
-
-
-class ChatRequest(BaseModel):
-    sop_id: Optional[str] = None
-    message: str
-
+class ChatAgentResponse(BaseModel):
+    reply: str
 
 class SuggestEditRequest(BaseModel):
     sop_id: Optional[str] = None
+    code: str
     instruction: str
 
+class SuggestEditResponse(BaseModel):
+    code: str
 
 class ApplyCodeEditRequest(BaseModel):
+    code: str
+    patch: str  # future use
+
+class ApplyCodeEditResponse(BaseModel):
+    code: str
+
+class ExplainRequest(BaseModel):
     sop_id: str
-    file_path: str
-    new_content: str
+    runtime: Optional[str] = None
 
+class ExplainResponse(BaseModel):
+    sop_id: str
+    runtime: str
+    explanation: str
 
-class ExplainCodeRequest(BaseModel):
-    sop_id: Optional[str] = None
-    runtime_key: Optional[str] = None
-    code_files: Optional[List[CodeFile]] = None
-    main_file: Optional[str] = None
-    editor_mode: Optional[str] = None
+# -----------------------------------------------------------------------------
+# Utility: SOP parsing & runtime suggestion
+# -----------------------------------------------------------------------------
+def _safe_text_from_upload(fobj: UploadFile) -> str:
+    try:
+        raw = fobj.file.read()
+        try:
+            return raw.decode("utf-8")
+        except Exception:
+            # Not valid UTF-8; return marker
+            return "<binary or non-utf8 document>"
+    finally:
+        try:
+            fobj.file.close()
+        except Exception:
+            pass
 
+def _extract_steps(text: str) -> List[str]:
+    """
+    Naive step extractor: split on newlines and pick non-empty items.
+    """
+    if not text or text.strip() == "<binary or non-utf8 document>":
+        return ["Receive input", "Process", "Finish"]
+    lines = [ln.strip(" •-").strip() for ln in text.splitlines()]
+    steps = [ln for ln in lines if ln and len(ln) > 2]
+    # keep first ~10
+    return steps[:10] or ["Receive input", "Process", "Finish"]
+
+def _suggest_runtimes(steps: List[str]) -> List[Dict[str, Any]]:
+    # Simple heuristic suggestions & confidences
+    candidates = [
+        {"key": "temporal", "name": "TEMPORAL", "confidence": 0.55, "reason": "Temporal (Java/TS) - good for code-first durable workflows"},
+        {"key": "bpmn", "name": "BPMN", "confidence": 0.50, "reason": "BPMN (XML) - good for human tasks & manual approvals"},
+        {"key": "camel", "name": "CAMEL", "confidence": 0.50, "reason": "Apache Camel (Java DSL) - good for API/adapter integration"},
+    ]
+    # Sort by confidence desc
+    return sorted(candidates, key=lambda x: x["confidence"], reverse=True)
+
+def _summarize_sop(steps: List[str]) -> Tuple[str, List[str], List[str]]:
+    # For demo, designate all steps as "automated_actions"; none manual
+    summary = f"Detected {len(steps)} steps. Will automate {len(steps)}; 0 remain manual."
+    return summary, steps, []
+
+# -----------------------------------------------------------------------------
+# Code generators (very safe strings; avoid str.format brace issues)
+# -----------------------------------------------------------------------------
+def generate_bpmn_xml(title: str, steps: List[str]) -> str:
+    """
+    Very minimal BPMN XML with tasks only (no flows for brevity).
+    """
+    lines = [
+        '<?xml version="1.0" encoding="UTF-8"?>',
+        '<bpmn:definitions xmlns:bpmn="http://www.omg.org/spec/BPMN/20100524/MODEL" id="Definitions_workflow">',
+        f'  <bpmn:process id="workflow" isExecutable="true">',
+    ]
+    for i, st in enumerate(steps, 1):
+        safe = st.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        lines.append(f'    <bpmn:task id="Task_{i}" name="{safe}" />')
+    lines += [
+        "  </bpmn:process>",
+        "</bpmn:definitions>",
+    ]
+    return "\n".join(lines)
+
+def generate_camel_java_dsl(title: str, steps: List[str]) -> str:
+    route_steps = []
+    for i, st in enumerate(steps, 1):
+        msg = st.replace('"', '\\"')
+        route_steps.append(f'            .to("log:step{i}?showAll=true&multiline=true") // {msg}')
+    route = "\n".join(route_steps) if route_steps else '            .to("log:empty")'
+
+    return (
+        "package com.example.routes;\n\n"
+        "import org.apache.camel.builder.RouteBuilder;\n"
+        "import org.springframework.stereotype.Component;\n\n"
+        "@Component\n"
+        "public class RouteBuilder_" + uuid.uuid4().hex[:6] + " extends RouteBuilder {\n"
+        "    @Override\n"
+        "    public void configure() throws Exception {\n"
+        '        from("direct:workbench_route")\n'
+        f"{route}\n"
+        "        ;\n"
+        "    }\n"
+        "}\n"
+    )
+
+def generate_temporal_java(title: str, steps: List[str]) -> str:
+    # Interface & implementation with Activities stub
+    iface = (
+        "package com.example.temporal;\n\n"
+        "import io.temporal.workflow.Workflow;\n\n"
+        "public interface IWorkflow" + uuid.uuid4().hex[:5] + " {\n"
+        "    void execute();\n"
+        "}\n"
+    )
+    acts_methods = []
+    for i, st in enumerate(steps, 1):
+        acts_methods.append(f"    void executeStep{i}(); // {st}")
+    activities = (
+        "interface Activities {\n" +
+        "\n".join(acts_methods) + "\n}\n"
+    )
+    impl_calls = []
+    for i, _ in enumerate(steps, 1):
+        impl_calls.append(f"        activities.executeStep{i}();")
+    impl = (
+        "/* Implementation */\n"
+        "public class WorkflowImpl" + uuid.uuid4().hex[:6] + " implements IWorkflow" + uuid.uuid4().hex[:5] + " {\n"
+        "    private final Activities activities = Workflow.newActivityStub(Activities.class);\n"
+        "    @Override\n"
+        "    public void execute() {\n" +
+        "\n".join(impl_calls) + "\n"
+        "    }\n"
+        "}\n"
+    )
+    return "\n".join([iface, "/* Activities interface (skeleton) */", activities, impl])
+
+def generate_knative_yaml(title: str, steps: List[str]) -> str:
+    # toy Knative Service
+    doc = {
+        "apiVersion": "serving.knative.dev/v1",
+        "kind": "Service",
+        "metadata": {"name": f"workbench-{uuid.uuid4().hex[:6]}"},
+        "spec": {
+            "template": {
+                "spec": {
+                    "containers": [{
+                        "image": "ghcr.io/example/workbench:latest",
+                        "env": [{"name": f"STEP_{i}", "value": s} for i, s in enumerate(steps, 1)]
+                    }]
+                }
+            }
+        }
+    }
+    return yaml.safe_dump(doc, sort_keys=False)
+
+def pick_editor_mode(runtime_key: str) -> str:
+    mapping = {
+        "bpmn": "xml",
+        "camel": "java",
+        "temporal": "java",
+        "knative": "yaml",
+    }
+    return mapping.get(runtime_key.lower(), "text")
+
+# -----------------------------------------------------------------------------
+# Grok (xAI) explainer
+# -----------------------------------------------------------------------------
+async def grok_explain(runtime: str, code: str) -> str:
+    """
+    Call xAI Chat Completions API. Falls back to heuristic on errors.
+    """
+    sys_prompt = (
+        "You are an automation analyst. Given the code below and the chosen runtime, "
+        "write a concise, plain-English explanation (bulleted where helpful) that a process "
+        "designer can understand. Avoid jargon. Keep it under ~180 words."
+    )
+    user_prompt = f"Runtime: {runtime}\n\nCode:\n```\n{code}\n```"
+
+    if not GROK_API_KEY:
+        logger.info("explain_code_text: heuristic (Groq unavailable or key missing)")
+        return heuristic_explanation(runtime, code)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            payload = {
+                "model": DEFAULT_MODEL or "gpt-5",
+                "messages": [
+                    {"role": "system", "content": sys_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                "temperature": 0.2,
+            }
+            headers = {
+                "Authorization": f"Bearer {GROK_API_KEY}",
+                "Content-Type": "application/json",
+            }
+            async with session.post(GROK_API_URL, headers=headers, json=payload, timeout=60) as resp:
+                if resp.status != 200:
+                    txt = await resp.text()
+                    logger.warning(f"grok explain non-200: {resp.status} {txt}")
+                    return heuristic_explanation(runtime, code)
+                data = await resp.json()
+                content = data["choices"][0]["message"]["content"]
+                return content.strip()
+    except Exception as e:
+        logger.info(f"explain_code_text: grok failed ({e}); falling back to heuristic")
+        return heuristic_explanation(runtime, code)
+
+def heuristic_explanation(runtime: str, code: str) -> str:
+    bullets = []
+    if runtime.lower() == "bpmn":
+        bullets = [
+            "Parses a BPMN process with user tasks for each step.",
+            "Each task represents a discrete activity in the business flow.",
+            "Intended for orchestration and human-in-the-loop approvals where needed.",
+            "This XML can be viewed and refined in a BPMN modeler."
+        ]
+    elif runtime.lower() == "camel":
+        bullets = [
+            "Defines an Apache Camel RouteBuilder pipeline.",
+            "Consumes from a direct endpoint and logs each step.",
+            "Good for system-to-system integration and adapters.",
+            "You can replace log steps with real components (HTTP, JMS, DB, etc.)."
+        ]
+    elif runtime.lower() == "temporal":
+        bullets = [
+            "Defines a Temporal workflow interface and implementation.",
+            "Each step is an Activity invocation (reliable, retryable).",
+            "Temporal persists state and handles retries/durable execution.",
+            "Implement Activities to call real services or perform tasks."
+        ]
+    else:
+        bullets = [
+            "Represents an automation workflow for the selected runtime.",
+            "Each step maps to a discrete unit of work.",
+            "You can customize handlers to integrate with real systems."
+        ]
+    return "This automation defines a workflow in the selected runtime.\n\n" + "\n".join([f"- {b}" for b in bullets])
+
+# -----------------------------------------------------------------------------
+# Core: Generate code from SOP & runtime
+# -----------------------------------------------------------------------------
+def generate_code_from_sop(sop_data: Dict[str, Any], runtime_key: str) -> Tuple[Dict[str, Any], str]:
+    title = sop_data.get("title") or "workflow"
+    steps = sop_data.get("steps") or ["Receive input", "Process", "Finish"]
+
+    runtime = runtime_key.lower()
+    if runtime == "bpmn":
+        content = generate_bpmn_xml(title, steps)
+        main_file = "main.xml"
+    elif runtime == "camel":
+        content = generate_camel_java_dsl(title, steps)
+        main_file = "RouteBuilder.java"
+    elif runtime == "temporal":
+        content = generate_temporal_java(title, steps)
+        main_file = "main.java"
+    elif runtime == "knative":
+        content = generate_knative_yaml(title, steps)
+        main_file = "service.yaml"
+    else:
+        content = "\n".join(steps)
+        main_file = "steps.txt"
+
+    editor_mode = pick_editor_mode(runtime)
+    code_files = [{"path": main_file, "content": content}]
+
+    # trivial UI schema + confidence
+    ui_schema = {
+        "runtime": runtime.upper(),
+        "nodes": [{"id": f"task_{i}", "label": s} for i, s in enumerate(steps, 1)],
+        "edges": [{"from": f"task_{i}", "to": f"task_{i+1}"} for i in range(1, len(steps))]
+    }
+    confidence = 0.65 if runtime in ("bpmn", "temporal") else 0.55
+
+    payload = {
+        "code_files": code_files,
+        "main_file": main_file,
+        "editor_mode": editor_mode,
+        "ui_schema": ui_schema,
+        "confidence": confidence
+    }
+    return payload, editor_mode
 
 # -----------------------------------------------------------------------------
 # Endpoints
 # -----------------------------------------------------------------------------
 @app.get("/api/health")
-def health():
-    return {"status": "ok"}
-
+async def health():
+    return {"ok": True}
 
 @app.post("/api/sop/upload", response_model=UploadSOPResponse)
 async def upload_sop(
@@ -405,315 +412,149 @@ async def upload_sop(
     text: Optional[str] = Form(None),
     scenario_id: Optional[str] = Form(None),
 ):
-    """
-    Accept SOP via file (pdf/txt) or plain text. Extract title + steps and store.
-    """
-    sop_text = text or ""
-    if (not sop_text) and file:
-        # Very simple text extraction for demo — in real code, parse PDF properly
-        raw = await file.read()
-        try:
-            sop_text = raw.decode("utf-8", errors="ignore")
-        except Exception:
-            sop_text = "<binary or non-utf8 document>"
+    # Accept either explicit text or uploaded file
+    sop_text = ""
+    if text and text.strip():
+        sop_text = text
+    elif file is not None:
+        sop_text = _safe_text_from_upload(file)
+    else:
+        sop_text = "No SOP text provided."
 
-    title, steps = parse_sop_text(sop_text)
+    steps = _extract_steps(sop_text)
+    suggested = _suggest_runtimes(steps)
+    summary, automated, manual = _summarize_sop(steps)
+
     sop_id = str(uuid.uuid4())
-    SOPS[sop_id] = {"title": title, "text": sop_text, "steps": steps}
-
-    auto_cnt = max(0, len(steps) - 0)  # demo: pretend all steps can be automated
-    man_cnt = 0
-    summary = f"Detected {len(steps)} steps. Will automate {auto_cnt}; {man_cnt} remain manual."
-
-    logger.info(f"Uploaded SOP {sop_id} title={title} steps={len(steps)}")
-
-    return {
-        "sop_id": sop_id,
-        "summary": summary,
-        "automated_actions": steps or ["<binary or non-utf8 document>"],
-        "manual_actions": [],
-        "suggested_runtimes": suggested_runtimes_for_steps(steps),
+    sop_store[sop_id] = {
+        "title": scenario_id or f"scenario-{sop_id}",
+        "text": sop_text,
+        "steps": steps,
+        "suggested_runtimes": suggested,
     }
 
+    logger.info(f"Uploaded SOP {sop_id} title={sop_store[sop_id]['title']} steps={len(steps)}")
+    return UploadSOPResponse(
+        sop_id=sop_id,
+        summary=summary,
+        automated_actions=automated,
+        manual_actions=manual,
+        suggested_runtimes=suggested,
+    )
 
 @app.post("/api/generate_code", response_model=GenerateCodeResponse)
 async def generate_code(req: GenerateCodeRequest):
-    sop = SOPS.get(req.sop_id)
-    if not sop:
+    sop_id = req.sop_id
+    runtime_key = (req.runtime_key or "bpmn").lower()
+
+    if sop_id not in sop_store:
         raise HTTPException(status_code=404, detail="sop_id not found")
 
-    title = sop.get("title") or "Untitled"
-    steps = sop.get("steps") or []
-    runtime_key = (req.runtime_key or "").lower().strip()
+    sop_data = sop_store[sop_id]
+    payload, editor_mode = generate_code_from_sop(sop_data, runtime_key)
 
-    code_files: List[Dict[str, str]] = []
-    main_file = ""
-    editor_mode = detect_editor_mode(runtime_key)
-    ui_schema: Dict[str, Any] = {}
-
-    if runtime_key == "bpmn":
-        content = generate_bpmn_xml(title, steps)
-        code_files = [{"path": "workflow.bpmn", "content": content}]
-        main_file = "workflow.bpmn"
-        ui_schema = {"diagram": "bpmn"}
-        confidence = 0.55
-    elif runtime_key == "camel":
-        content = generate_camel_java_dsl(title, steps)
-        code_files = [{"path": "RouteBuilder.java", "content": content}]
-        main_file = "RouteBuilder.java"
-        ui_schema = {"ide": "java"}
-        confidence = 0.52
-    elif runtime_key == "knative":
-        content = generate_knative_yaml(title, steps)
-        code_files = [{"path": "service.yaml", "content": content}]
-        main_file = "service.yaml"
-        ui_schema = {"ide": "yaml"}
-        confidence = 0.50
-    elif runtime_key == "temporal":
-        content = generate_temporal_java(title, steps)
-        code_files = [{"path": "Workflow.java", "content": content}]
-        main_file = "Workflow.java"
-        ui_schema = {"ide": "java"}
-        confidence = 0.58
-    else:
-        # Fallback to a plain text pseudo-code
-        lines = ["# Pseudo-workflow"]
-        for i, s in enumerate(steps, 1):
-            lines.append(f"{i}. {s}")
-        content = "\n".join(lines)
-        code_files = [{"path": "workflow.txt", "content": content}]
-        main_file = "workflow.txt"
-        editor_mode = "text"
-        ui_schema = {"ide": "text"}
-        confidence = 0.45
-
-    # Persist in session for later hydration
-    SESSIONS[req.sop_id] = {
-        "runtime_key": runtime_key,
-        "code_files": code_files,
-        "main_file": main_file,
-        "editor_mode": editor_mode,
+    generated_code_store[sop_id] = {
+        "runtime": runtime_key,
+        **payload
     }
 
-    # Optionally pre-generate explanation (not required)
-    main_content = code_files[0]["content"] if code_files else ""
-    explanation = explain_with_grok(runtime_key, editor_mode, main_content)
-    if explanation is None:
-        explanation = heuristic_explanation(runtime_key, editor_mode, main_file, code_files)
-        explain_source = "heuristic"
-    else:
-        explain_source = "grok"
-    SESSIONS[req.sop_id]["explanation"] = explanation
+    logger.info(f"Generated code for sop_id={sop_id} runtime={runtime_key} (explain: heuristic)")
+    return GenerateCodeResponse(**payload)
 
-    logger.info(f"Generated code for sop_id={req.sop_id} runtime={runtime_key} (explain: {explain_source})")
-
-    return {
-        "code_files": code_files,
-        "main_file": main_file,
-        "editor_mode": editor_mode,
-        "ui_schema": ui_schema,
-        "confidence": 0.55,
-    }
-
-
-@app.post("/api/visualize_code")
-async def visualize_code(req: VisualizeRequest):
-    """
-    Returns a simple graph (nodes/edges) visualization derived from stored SOP or provided code.
-    """
-    steps: List[str] = []
-    if req.sop_id and req.sop_id in SOPS:
-        steps = SOPS[req.sop_id].get("steps", [])
-    elif req.code_files and req.main_file:
-        # Very naive extraction for demo
-        main = next((cf for cf in req.code_files if cf.path == req.main_file), None)
-        if main:
-            # try to split lines as steps
-            lines = [ln.strip() for ln in main.content.splitlines() if ln.strip()]
-            steps = [ln for ln in lines[:10]]
-
-    nodes = []
-    edges = []
-    prev = None
-    for i, s in enumerate(steps, 1):
-        nid = f"n{i}"
-        nodes.append({"id": nid, "label": s})
-        if prev:
-            edges.append({"from": prev, "to": nid})
-        prev = nid
-    if not nodes:
-        nodes = [{"id": "n1", "label": "No steps available"}]
-
-    return {"nodes": nodes, "edges": edges}
-
-
-@app.post("/api/run_test")
+@app.post("/api/run_test", response_model=RunTestResponse)
 async def run_test(req: RunTestRequest):
-    """
-    Mock test runner. Returns a simple pass with echo logs.
-    """
-    result = {
-        "status": "passed",
-        "logs": [
-            "Test runner initialized.",
-            f"runtime: {req.runtime_key or 'unknown'}",
-            f"main_file: {req.main_file or 'unknown'}",
-            "Steps executed successfully (mock).",
-        ],
-        "outputs": {"example": True},
-    }
-    return result
+    # Simulated test runner
+    sop_id = req.sop_id
+    runtime = (req.runtime or "bpmn").lower()
+    if not req.code:
+        # use stored if available
+        if sop_id in generated_code_store:
+            # find main file content
+            cf = generated_code_store[sop_id]["code_files"]
+            code = next((c["content"] for c in cf if c["path"] == generated_code_store[sop_id]["main_file"]), cf[0]["content"])
+        else:
+            code = ""
+    else:
+        code = req.code
 
+    logs = [
+        f"Runtime: {runtime}",
+        "Compiling (simulated)... OK",
+        "Running workflow (simulated)... OK",
+        "All steps executed."
+    ]
+    return RunTestResponse(ok=True, logs=logs, output={"result": "success"})
 
-@app.post("/api/chat_agent")
-async def chat_agent(req: ChatRequest):
-    """
-    Very simple echo + tip; replace with your actual agent if needed.
-    """
-    tip = "Tip: You can request an edit like 'rename step 3 to Validate KYC'."
-    return {"reply": f"You said: {req.message}", "tip": tip}
+@app.post("/api/visualize_code", response_model=VisualizeResponse)
+async def visualize_code(req: VisualizeRequest):
+    sop_id = req.sop_id
+    if sop_id not in sop_store:
+        raise HTTPException(status_code=404, detail="sop_id not found")
 
+    steps = sop_store[sop_id].get("steps", [])
+    nodes = [{"id": f"n{i}", "label": s} for i, s in enumerate(steps, 1)]
+    edges = [{"from": f"n{i}", "to": f"n{i+1}"} for i in range(1, len(steps))]
+    return VisualizeResponse(nodes=nodes, edges=edges)
 
-@app.post("/api/chat_agent_suggest_edit")
+@app.post("/api/chat_agent", response_model=ChatAgentResponse)
+async def chat_agent(req: ChatAgentRequest):
+    # Lightweight echo assistant for now
+    if not req.messages:
+        return ChatAgentResponse(reply="Please provide a question.")
+    last = req.messages[-1].get("content", "")
+    return ChatAgentResponse(reply=f"I read: {last}\nTry adjusting step 2 to call a real service.")
+
+@app.post("/api/chat_agent_suggest_edit", response_model=SuggestEditResponse)
 async def chat_agent_suggest_edit(req: SuggestEditRequest):
+    # Naive suggestion example: add a comment to top
+    suggestion = "// Suggested: add validation before step 1\n" + req.code
+    return SuggestEditResponse(code=suggestion)
+
+@app.post("/api/apply_code_edit", response_model=ApplyCodeEditResponse)
+async def apply_code_edit(req: ApplyCodeEditRequest):
+    # No real patching here
+    return ApplyCodeEditResponse(code=req.code)
+
+# -------------------- NEW / UPDATED --------------------
+
+@app.post("/api/explain_code_text", response_model=ExplainResponse)
+async def explain_code_text(req: ExplainRequest):
     """
-    Suggest a trivial edit to the main file (demo).
+    Always return an explanation:
+    - If generated code missing for sop_id, auto-generate using requested or default runtime.
+    - Then explain via Grok; if Grok unavailable, return heuristic.
     """
     sop_id = req.sop_id
-    if not sop_id or sop_id not in SESSIONS:
-        return {"suggestion": "No code found to edit. Please generate code first."}
-    main_file = SESSIONS[sop_id]["main_file"]
-    return {"file_path": main_file, "new_content": "// suggested change\n" + SESSIONS[sop_id]["code_files"][0]["content"]}
+    runtime = (req.runtime or "bpmn").lower()
 
+    if sop_id not in sop_store:
+        raise HTTPException(status_code=404, detail="SOP not found. Please upload it first.")
 
-@app.post("/api/apply_code_edit")
-async def apply_code_edit(req: ApplyCodeEditRequest):
-    """
-    Apply an edit to a file in session.
-    """
-    sess = SESSIONS.get(req.sop_id)
-    if not sess:
-        raise HTTPException(status_code=404, detail="sop_id not found in session")
-    updated = False
-    for cf in sess["code_files"]:
-        if cf["path"] == req.file_path:
-            cf["content"] = req.new_content
-            updated = True
-            break
-    if not updated:
-        raise HTTPException(status_code=404, detail="file_path not found in session")
-    return {"status": "ok"}
+    # If we don't have code yet, auto-generate it
+    if sop_id not in generated_code_store:
+        sop_data = sop_store[sop_id]
+        payload, _ = generate_code_from_sop(sop_data, runtime)
+        generated_code_store[sop_id] = {
+            "runtime": runtime,
+            **payload
+        }
+        logger.info(f"Auto-generated code for explanation sop_id={sop_id} runtime={runtime}")
 
+    code_entry = generated_code_store[sop_id]
+    # Find main file content
+    main_path = code_entry["main_file"]
+    main_content = next(
+        (c["content"] for c in code_entry["code_files"] if c["path"] == main_path),
+        code_entry["code_files"][0]["content"]
+    )
 
-@app.post("/api/explain_code_text")
-async def explain_code_text(req: Request, body: Optional[ExplainCodeRequest] = None):
-    """
-    Returns a plain-language explanation of what the automation code is doing.
-    - Accepts camelCase or snake_case
-    - Hydrates from server session by sop_id if fields are missing
-    - Always 200; includes fallback heuristic if Grok isn't available
-    """
-    try:
-        if body is None:
-            raw = {}
-            try:
-                raw = await req.json()
-            except Exception:
-                raw = {}
-            # Normalize keys from camelCase to snake_case
-            norm: Dict[str, Any] = {}
-            for k, v in raw.items():
-                if k == "runtimeKey": norm["runtime_key"] = v
-                elif k == "codeFiles": norm["code_files"] = v
-                elif k == "mainFile": norm["main_file"] = v
-                elif k == "editorMode": norm["editor_mode"] = v
-                else:
-                    norm[k] = v
-            body = ExplainCodeRequest(**norm)
-    except Exception:
-        body = ExplainCodeRequest()
+    explanation = await grok_explain(runtime, main_content)
+    logger.info(f"explain_code_text: delivered explanation via {'grok' if GROK_API_KEY else 'heuristic'}")
+    return ExplainResponse(sop_id=sop_id, runtime=runtime, explanation=explanation)
 
-    sop_id = body.sop_id
-    runtime_key = (body.runtime_key or "").lower().strip() or None
-    code_files = body.code_files
-    main_file = body.main_file
-    editor_mode = (body.editor_mode or "").lower().strip() or None
-
-    # Hydrate from session if needed
-    hydrated = False
-    if (not code_files or not main_file or not editor_mode or not runtime_key) and sop_id:
-        try:
-            session = SESSIONS.get(sop_id)
-            if session:
-                if not code_files and "code_files" in session:
-                    # convert dicts -> CodeFile models
-                    code_files = [CodeFile(**cf) for cf in session["code_files"]]
-                if not main_file and "main_file" in session:
-                    main_file = session["main_file"]
-                if not editor_mode and "editor_mode" in session:
-                    editor_mode = session["editor_mode"]
-                if not runtime_key and "runtime_key" in session:
-                    runtime_key = session["runtime_key"]
-                hydrated = True
-        except Exception as e:
-            logger.info(f"explain_code_text: hydration from session failed: {e}")
-
-    # If still missing core data, return gentle 200 message
-    if not code_files or not main_file:
-        msg = (
-            "I don’t have the generated code to explain yet. "
-            "Please run code generation first, then try again."
-        )
-        if sop_id and not hydrated:
-            msg += " (I also attempted to hydrate from the server session using your sop_id but couldn’t find code.)"
-        return JSONResponse(
-            status_code=200,
-            content={
-                "explanation": msg,
-                "used": {
-                    "sop_id": sop_id,
-                    "runtime_key": runtime_key,
-                    "editor_mode": editor_mode,
-                    "hydrated_from_session": hydrated,
-                },
-            },
-        )
-
-    # Get main file content
-    try:
-        primary = next((f for f in code_files if f.path == main_file), None) or code_files[0]
-        main_content = primary.content
-    except Exception:
-        main_content = ""
-
-    # Try Grok; fallback to heuristic
-    explanation = explain_with_grok(runtime_key, editor_mode, main_content)
-    used_model = "grok" if explanation else "heuristic"
-    if not explanation:
-        # Convert CodeFile models to dicts if needed
-        cf_list: List[Dict[str, str]] = []
-        try:
-            for f in code_files:
-                if isinstance(f, CodeFile):
-                    cf_list.append({"path": f.path, "content": f.content})
-                else:
-                    cf_list.append(f)  # type: ignore
-        except Exception:
-            cf_list = []
-        explanation = heuristic_explanation(runtime_key, editor_mode, main_file, cf_list)
-
-    # Store latest explanation in session if sop_id
-    if sop_id:
-        SESSIONS.setdefault(sop_id, {})
-        SESSIONS[sop_id]["explanation"] = explanation
-
-    return {
-        "explanation": explanation,
-        "used": {
-            "model": used_model,
-            "sop_id": sop_id,
-            "runtime_key": runtime_key,
-            "editor_mode": editor_mode,
-            "hydrated_from_session": hydrated,
-        },
-    }
+# -----------------------------------------------------------------------------
+# Root (optional)
+# -----------------------------------------------------------------------------
+@app.get("/")
+async def root():
+    return JSONResponse({"detail": "Workbench Studio Backend is running"})
