@@ -13,7 +13,7 @@ from fastapi import FastAPI, UploadFile, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 
-app = FastAPI(title="Workbench Studio Backend")
+app = FastAPI(title="Workbench Studio Backend", version="0.1.0")
 
 # CORS (open for dev; restrict in prod)
 app.add_middleware(
@@ -29,6 +29,7 @@ app.add_middleware(
 GROK_API_URL = os.getenv("GROK_API_URL")
 GROK_API_KEY = os.getenv("GROK_API_KEY")
 DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "gpt-5")
+DISABLE_LLM = os.getenv("DISABLE_LLM", "").strip() == "1"
 
 # In-memory store (replace with DB in production)
 STORE: Dict[str, Dict[str, Any]] = {}
@@ -87,7 +88,7 @@ class ChatResponse(BaseModel):
 class DiagramNode(BaseModel):
     id: str
     label: str
-    type: Optional[str] = None  # e.g., 'task', 'endpoint', 'service', 'activity'
+    type: Optional[str] = None
 
 class DiagramEdge(BaseModel):
     source: str
@@ -149,24 +150,78 @@ def extract_steps_from_text(text: str) -> List[str]:
     return steps
 
 async def call_ai_model(prompt: str, max_tokens: int = 1200, temperature: float = 0.0) -> str:
-    if GROK_API_URL and GROK_API_KEY:
-        headers = {"Authorization": "Bearer {k}".format(k=GROK_API_KEY), "Content-Type": "application/json"}
-        payload = {"model": DEFAULT_MODEL, "prompt": prompt, "max_tokens": max_tokens, "temperature": temperature}
-        async with aiohttp.ClientSession() as session:
-            async with session.post(GROK_API_URL, headers=headers, json=payload, timeout=60) as resp:
-                text = await resp.text()
+    """
+    Try Grok/xAI (OpenAI-compatible chat) first with `messages`, then legacy `prompt`.
+    If any error/invalid payload is detected, return 'LLM_NOT_CONFIGURED' so callers fall back to templates.
+    You can hard-disable with env DISABLE_LLM=1.
+    """
+    if DISABLE_LLM or not (GROK_API_URL and GROK_API_KEY):
+        await asyncio.sleep(0.01)
+        return "LLM_NOT_CONFIGURED"
+
+    headers = {"Authorization": "Bearer {k}".format(k=GROK_API_KEY), "Content-Type": "application/json"}
+
+    def parse_ai_text(payload: Any) -> Optional[str]:
+        # Return None if this smells like an error
+        if isinstance(payload, dict):
+            if "error" in payload:
+                return None
+            if "choices" in payload and payload["choices"]:
+                ch = payload["choices"][0]
+                if isinstance(ch, dict):
+                    msg = ch.get("message")
+                    if isinstance(msg, dict):
+                        c = msg.get("content")
+                        if isinstance(c, str) and c.strip():
+                            return c
+                    t = ch.get("text")
+                    if isinstance(t, str) and t.strip():
+                        return t
+            if isinstance(payload.get("output"), str) and payload["output"].strip():
+                return payload["output"]
+        elif isinstance(payload, str) and payload.strip():
+            low = payload.lower()
+            if "bad data" in low or "messages cannot be empty" in low or "error" in low:
+                return None
+            return payload
+        return None
+
+    async with aiohttp.ClientSession() as session:
+        # 1) Chat format
+        try:
+            body = {
+                "model": DEFAULT_MODEL,
+                "messages": [{"role": "user", "content": prompt}],
+                "max_tokens": max_tokens,
+                "temperature": temperature,
+            }
+            async with session.post(GROK_API_URL, headers=headers, json=body, timeout=60) as resp:
+                txt = await resp.text()
                 try:
-                    j = json.loads(text)
-                    if isinstance(j, dict):
-                        if "choices" in j and j["choices"]:
-                            c = j["choices"][0]
-                            return c.get("text") or (c.get("message") or {}).get("content") or str(c)
-                        if "output" in j:
-                            return j["output"]
-                    return str(j)
+                    data = json.loads(txt)
                 except Exception:
-                    return text
-    await asyncio.sleep(0.01)
+                    data = txt
+                out = parse_ai_text(data)
+                if out:
+                    return out
+        except Exception:
+            pass
+
+        # 2) Legacy 'prompt'
+        try:
+            body = {"model": DEFAULT_MODEL, "prompt": prompt, "max_tokens": max_tokens, "temperature": temperature}
+            async with session.post(GROK_API_URL, headers=headers, json=body, timeout=60) as resp:
+                txt = await resp.text()
+                try:
+                    data = json.loads(txt)
+                except Exception:
+                    data = txt
+                out = parse_ai_text(data)
+                if out:
+                    return out
+        except Exception:
+            pass
+
     return "LLM_NOT_CONFIGURED"
 
 def heuristic_suggest_runtimes(steps: List[str]) -> List[SuggestedRuntime]:
@@ -537,17 +592,32 @@ async def upload_sop(
 
     content = ""
     if file:
-        b = await file.read()
+        raw = await file.read()
+        # Try utf-8 first
         try:
-            content = b.decode("utf-8")
+            content = raw.decode("utf-8")
         except Exception:
-            content = "<binary or non-utf8 document>"
+            # Try minimal PDF extraction (optional dependency)
+            is_pdf = (file.content_type or "").lower() == "application/pdf" or (file.filename or "").lower().endswith(".pdf")
+            if is_pdf:
+                try:
+                    import tempfile
+                    from pdfminer.high_level import extract_text  # type: ignore
+                    with tempfile.NamedTemporaryFile(suffix=".pdf", delete=True) as tmp:
+                        tmp.write(raw)
+                        tmp.flush()
+                        extracted = extract_text(tmp.name) or ""
+                    content = extracted.strip() if extracted else ""
+                except Exception:
+                    content = ""
+            if not content:
+                content = "<binary or non-utf8 document>"
     else:
         content = text or ""
 
     steps = extract_steps_from_text(content)
 
-    # LLM-first summary
+    # LLM-first summary, fallback to heuristic
     summary: Optional[str] = None
     automated: Optional[List[str]] = None
     manual: Optional[List[str]] = None
@@ -560,7 +630,7 @@ async def upload_sop(
     if summary is None:
         summary, automated, manual = build_summary_and_action_split(steps)
 
-    # LLM-first runtime ranking
+    # LLM-first runtime ranking, fallback to heuristic
     try:
         suggested = await ai_suggest_runtimes(steps)
     except Exception:
@@ -594,22 +664,31 @@ async def generate_code(req: GenerateCodeRequest):
         raise HTTPException(status_code=404, detail="sop_id not found")
     steps = sop.get("steps", [])[:20]
     title = (sop.get("scenario_id") or "workbench_sop")[:60]
-
     runtime = (req.runtime_key or "").lower()
+
     code_files: List[CodeFile] = []
     editor_mode = "text"
     confidence = 0.7
 
-    # LLM-first
+    # LLM-first attempt (but do NOT trust error bodies)
     prompt = "Generate a skeleton automation for runtime={rt} for SOP titled: {title}\n\nSteps:\n".format(
         rt=runtime, title=title
     )
     for i, s in enumerate(steps, start=1):
         prompt += "{i}. {s}\n".format(i=i, s=s)
-    ai_response = await call_ai_model(prompt, max_tokens=1500, temperature=0.0)
-    use_llm = ai_response and ai_response.strip() != "LLM_NOT_CONFIGURED"
 
-    if use_llm and len(ai_response) > 50:
+    ai_response = await call_ai_model(prompt, max_tokens=1500, temperature=0.0)
+
+    def looks_like_error(s: str) -> bool:
+        low = (s or "").lower()
+        return any(term in low for term in [
+            "error", "invalid", "bad data", "messages cannot be empty",
+            "not configured", "llm_not_configured"
+        ])
+
+    use_llm = bool(ai_response and isinstance(ai_response, str) and len(ai_response.strip()) > 80 and not looks_like_error(ai_response))
+
+    if use_llm:
         path = "automation_{rt}.txt".format(rt=runtime)
         if runtime == "bpmn":
             path = "process.bpmn"; editor_mode = "xml"
@@ -622,7 +701,7 @@ async def generate_code(req: GenerateCodeRequest):
         code_files.append(CodeFile(path=path, content=ai_response))
         confidence = 0.85
     else:
-        # Template fallback
+        # Template fallback: guarantees visible code in IDE
         if runtime == "bpmn":
             content = generate_bpmn_xml(title, steps)
             code_files.append(CodeFile(path="process.bpmn", content=content))
@@ -643,7 +722,7 @@ async def generate_code(req: GenerateCodeRequest):
             code_files.append(CodeFile(path="automation.txt", content="// Unsupported runtime"))
             editor_mode = "text"; confidence = 0.5
 
-    # Simple UI schema inference
+    # UI schema inference
     ui_schema: Dict[str, Any] = {"title": title, "fields": []}
     joined = " ".join(steps).lower()
     if "amount" in joined:
@@ -695,7 +774,7 @@ async def chat_agent(req: ChatRequest):
     prompt = "Context SOP:\n{ctx}\n\nUser: {msg}\nAssistant:".format(ctx=context, msg=req.message)
     ai_response = await call_ai_model(prompt, max_tokens=800, temperature=0.2)
     if not ai_response or ai_response.strip() == "LLM_NOT_CONFIGURED":
-        reply = "Agent offline (LLM not configured). Please set GROK_API_URL and GROK_API_KEY."
+        reply = "Agent offline (LLM not configured). Please set GROK_API_URL and GROK_API_KEY or DISABLE_LLM=0."
     else:
         reply = ai_response
     return ChatResponse(reply=reply, meta={"model_used": DEFAULT_MODEL})
@@ -822,3 +901,12 @@ async def visualize_code_endpoint(sop_id: str = Form(...), runtime_key: str = Fo
 @app.get("/api/health")
 async def health():
     return {"status": "ok"}
+
+@app.get("/")
+async def root():
+    return {
+        "name": "Workbench Studio Backend",
+        "version": "0.1.0",
+        "docs": "/docs",
+        "health": "/api/health"
+    }
