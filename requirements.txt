@@ -6,8 +6,7 @@ python-multipart==0.0.9
 python-dotenv==1.1.1
 PyYAML==6.0.2
 
-# OpenAI SDK used in app.py (works with Grok via base_url)
 openai==1.51.2
+httpx==0.28.1
 
-# (Optional) You can keep or remove this; app.py doesn’t need it if you use OpenAI SDK
 groq==0.31.0
